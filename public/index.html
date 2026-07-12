@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Tanks</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    #canvas-holder {
+      position: relative;
+      display: block;
+      /* same sizing formula as #game in style.css so the overlay hugs the canvas */
+      width: min(100%, calc((100vh - 96px) * 5 / 3));
+      width: min(100%, calc((100svh - 96px) * 5 / 3));
+      max-width: 100%;
+      margin: 0 auto;
+      min-height: 0;
+    }
+    #join-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(18, 20, 14, 0.93);
+      border-radius: 4px;
+    }
+    #join-panel {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 14px;
+      padding: 26px 34px;
+      background: #262b1f;
+      border: 1px solid #4a5238;
+      border-radius: 8px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6);
+    }
+    #join-panel h2 {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: #cdd6a3;
+    }
+    #join-name {
+      width: 220px;
+      padding: 8px 10px;
+      font-size: 15px;
+      color: #eee;
+      background: #1c1f16;
+      border: 1px solid #4a5238;
+      border-radius: 4px;
+      outline: none;
+      text-align: center;
+    }
+    #join-name:focus {
+      border-color: #8a9a55;
+    }
+    .swatch-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .swatch {
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border: 2px solid #4a5238;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+    .swatch.selected {
+      border-color: #ffdd33;
+      box-shadow: 0 0 6px #ffdd3388;
+    }
+    #join-custom {
+      width: 32px;
+      height: 32px;
+      padding: 0;
+      border: 2px solid #4a5238;
+      border-radius: 6px;
+      background: #1c1f16;
+      cursor: pointer;
+    }
+    #join-custom.selected {
+      border-color: #ffdd33;
+      box-shadow: 0 0 6px #ffdd3388;
+    }
+    .swatch-label {
+      font-size: 12px;
+      color: #aaa;
+    }
+    #join-btn {
+      padding: 10px 28px;
+      font-size: 15px;
+      font-weight: bold;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: #1c1f16;
+      background: #8a9a55;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #join-btn:hover {
+      background: #a3b56a;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <h1>Tanks</h1>
+    <p id="status">Enter your name and join the battle</p>
+    <div id="canvas-holder">
+      <canvas id="game" width="1000" height="600"></canvas>
+      <div id="join-overlay">
+        <form id="join-panel">
+          <h2>Enlist</h2>
+          <input id="join-name" type="text" maxlength="12" placeholder="Your name" autocomplete="off" autofocus />
+          <div class="swatch-row">
+            <button type="button" class="swatch selected" data-color="#7a8b3f" style="background:#7a8b3f" title="Olive"></button>
+            <button type="button" class="swatch" data-color="#5d7a8c" style="background:#5d7a8c" title="Field gray"></button>
+            <button type="button" class="swatch" data-color="#b0803f" style="background:#b0803f" title="Desert tan"></button>
+            <button type="button" class="swatch" data-color="#7d5a5a" style="background:#7d5a5a" title="Maroon"></button>
+            <button type="button" class="swatch" data-color="#46606e" style="background:#46606e" title="Navy"></button>
+            <button type="button" class="swatch" data-color="#55613a" style="background:#55613a" title="Dark olive"></button>
+            <span class="swatch-label">custom</span>
+            <input id="join-custom" type="color" value="#7a8b3f" title="Custom color" />
+          </div>
+          <button id="join-btn" type="submit">Join Battle</button>
+        </form>
+      </div>
+    </div>
+    <p class="help">
+      Move: <b>A/D</b> or <b>&larr;/&rarr;</b> &nbsp;|&nbsp;
+      Aim: <b>W/S</b> or <b>&uarr;/&darr;</b> &nbsp;|&nbsp;
+      Fire: hold <b>Space</b> to charge, release to shoot &nbsp;|&nbsp;
+      Turn-based: firing ends your turn
+    </p>
+  </div>
+  <script src="sounds.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>

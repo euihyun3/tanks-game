@@ -1,0 +1,58 @@
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+body {
+  background: #1c1c24;
+  color: #eee;
+  font-family: system-ui, sans-serif;
+}
+#wrap {
+  height: 100%;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto; /* h1, status, canvas, help */
+  text-align: center;
+}
+/* Fixed line-heights keep the non-canvas rows a known height (~94px total
+   incl. #wrap padding) so the canvas size calc below stays accurate. */
+#wrap h1 {
+  font-size: 1.3rem;
+  line-height: 25px;
+  margin: 2px 0;
+}
+#status {
+  min-height: 20px;
+  line-height: 20px;
+  margin: 2px 0 6px;
+  color: #9ad1ff;
+}
+#status.my-turn {
+  color: #ffdd33;
+  font-weight: bold;
+}
+#game {
+  background: #7ec8e3;
+  border: 2px solid #444;
+  border-radius: 4px;
+  box-sizing: border-box;
+  justify-self: center;
+  align-self: center;
+  min-width: 0;
+  min-height: 0;
+  /* As large as possible at 5:3 without overflowing: limited by the
+     container width or by the viewport height minus the ~96px of chrome. */
+  width: min(100%, calc((100vh - 96px) * 5 / 3));
+  width: min(100%, calc((100svh - 96px) * 5 / 3));
+  height: auto;
+  max-height: 100%; /* safety net: never crop, even if text wraps */
+}
+.help {
+  color: #aaa;
+  font-size: 12px;
+  line-height: 15px;
+  margin: 6px 0 0;
+}
