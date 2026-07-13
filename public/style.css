@@ -5,9 +5,20 @@ body {
   overflow: hidden;
 }
 body {
-  background: #1c1c24;
-  color: #eee;
-  font-family: system-ui, sans-serif;
+  /* Very dark retro navy + faint CSS-only scanlines */
+  background-color: #0a0a14;
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgba(255, 255, 255, 0.03) 0px,
+    rgba(255, 255, 255, 0.03) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  color: #e8e8e8;
+  font-family: "Courier New", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 1px;
 }
 #wrap {
   height: 100%;
@@ -17,42 +28,58 @@ body {
   grid-template-rows: auto auto minmax(0, 1fr) auto; /* h1, status, canvas, help */
   text-align: center;
 }
-/* Fixed line-heights keep the non-canvas rows a known height (~94px total
-   incl. #wrap padding) so the canvas size calc below stays accurate. */
+/* Fixed line-heights keep the non-canvas rows a known height (~106px total
+   incl. #wrap padding) so the canvas size calc below stays accurate:
+   16 (wrap pad) + 36 (h1) + 30 (status) + 24 (help) = 106px. */
 #wrap h1 {
   font-size: 1.3rem;
-  line-height: 25px;
-  margin: 2px 0;
+  line-height: 28px;
+  margin: 4px 0;
+  color: #4ef04e;
+  letter-spacing: 4px;
+  text-shadow: 3px 3px 0 #000;
 }
 #status {
   min-height: 20px;
   line-height: 20px;
-  margin: 2px 0 6px;
+  margin: 2px 0 8px;
   color: #9ad1ff;
+  letter-spacing: 2px;
 }
 #status.my-turn {
   color: #ffdd33;
   font-weight: bold;
+  animation: turn-blink 1.2s steps(2, jump-none) infinite;
+}
+@keyframes turn-blink {
+  50% {
+    opacity: 0.55;
+  }
 }
 #game {
   background: #7ec8e3;
-  border: 2px solid #444;
-  border-radius: 4px;
+  border: 4px solid #d8d8d8;
+  border-radius: 0;
+  image-rendering: crisp-edges;
+  image-rendering: pixelated;
   box-sizing: border-box;
   justify-self: center;
   align-self: center;
   min-width: 0;
   min-height: 0;
   /* As large as possible at 5:3 without overflowing: limited by the
-     container width or by the viewport height minus the ~96px of chrome. */
-  width: min(100%, calc((100vh - 96px) * 5 / 3));
-  width: min(100%, calc((100svh - 96px) * 5 / 3));
+     container width or by the viewport height minus the ~106px of chrome
+     (plus a few px of slack for the 4px border). */
+  width: min(100%, calc((100vh - 110px) * 5 / 3));
+  width: min(100%, calc((100svh - 110px) * 5 / 3));
   height: auto;
   max-height: 100%; /* safety net: never crop, even if text wraps */
 }
 .help {
-  color: #aaa;
-  font-size: 12px;
-  line-height: 15px;
-  margin: 6px 0 0;
+  color: #8a8fa3;
+  font-size: 10px;
+  line-height: 16px;
+  letter-spacing: 1.5px;
+  margin: 8px 0 0;
+  text-transform: uppercase;
 }

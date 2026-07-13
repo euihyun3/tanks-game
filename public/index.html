@@ -9,8 +9,8 @@
       position: relative;
       display: block;
       /* same sizing formula as #game in style.css so the overlay hugs the canvas */
-      width: min(100%, calc((100vh - 96px) * 5 / 3));
-      width: min(100%, calc((100svh - 96px) * 5 / 3));
+      width: min(100%, calc((100vh - 110px) * 5 / 3));
+      width: min(100%, calc((100svh - 110px) * 5 / 3));
       max-width: 100%;
       margin: 0 auto;
       min-height: 0;
@@ -23,84 +23,125 @@
       align-items: center;
       justify-content: center;
       background: rgba(18, 20, 14, 0.93);
-      border-radius: 4px;
     }
     #join-panel {
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 14px;
-      padding: 26px 34px;
+      gap: 12px;
+      padding: 20px 28px;
       background: #262b1f;
-      border: 1px solid #4a5238;
-      border-radius: 8px;
-      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6);
+      border: 4px solid #8a9a55;
+      border-radius: 0;
+      box-shadow: 8px 8px 0 rgba(0, 0, 0, 0.55);
+      font-family: "Courier New", Courier, monospace;
+      text-transform: uppercase;
     }
     #join-panel h2 {
       margin: 0;
       font-size: 20px;
-      letter-spacing: 2px;
-      text-transform: uppercase;
+      letter-spacing: 3px;
       color: #cdd6a3;
     }
-    #join-name {
+    .row-label {
+      font-size: 11px;
+      font-weight: bold;
+      letter-spacing: 1px;
+      color: #8a9a55;
+    }
+    .opt-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .opt-btn {
+      font-family: inherit;
+      text-transform: uppercase;
+      font-weight: bold;
+      font-size: 12px;
+      letter-spacing: 1px;
+      padding: 8px 12px;
+      color: #cdd6a3;
+      background: #1c1f16;
+      border: 3px solid #4a5238;
+      border-radius: 0;
+      cursor: pointer;
+    }
+    .opt-btn:hover {
+      border-color: #8a9a55;
+    }
+    .opt-btn.selected {
+      border-color: #ffdd33;
+      color: #ffdd33;
+      background: #3a4228;
+    }
+    .name-input {
       width: 220px;
       padding: 8px 10px;
-      font-size: 15px;
+      font-size: 14px;
+      font-family: inherit;
+      font-weight: bold;
+      letter-spacing: 1px;
       color: #eee;
       background: #1c1f16;
-      border: 1px solid #4a5238;
-      border-radius: 4px;
+      border: 3px solid #4a5238;
+      border-radius: 0;
       outline: none;
       text-align: center;
     }
-    #join-name:focus {
+    .name-input:focus {
       border-color: #8a9a55;
     }
     .swatch-row {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
     }
     .swatch {
-      width: 28px;
-      height: 28px;
+      width: 26px;
+      height: 26px;
       padding: 0;
-      border: 2px solid #4a5238;
-      border-radius: 50%;
+      border: 3px solid #4a5238;
+      border-radius: 0;
       cursor: pointer;
     }
     .swatch.selected {
       border-color: #ffdd33;
-      box-shadow: 0 0 6px #ffdd3388;
     }
-    #join-custom {
-      width: 32px;
-      height: 32px;
+    .custom-color {
+      width: 30px;
+      height: 30px;
       padding: 0;
-      border: 2px solid #4a5238;
-      border-radius: 6px;
+      border: 3px solid #4a5238;
+      border-radius: 0;
       background: #1c1f16;
       cursor: pointer;
     }
-    #join-custom.selected {
+    .custom-color.selected {
       border-color: #ffdd33;
-      box-shadow: 0 0 6px #ffdd3388;
     }
     .swatch-label {
-      font-size: 12px;
+      font-size: 11px;
       color: #aaa;
+    }
+    #p2-extra {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
     }
     #join-btn {
       padding: 10px 28px;
       font-size: 15px;
       font-weight: bold;
-      letter-spacing: 1px;
+      letter-spacing: 2px;
+      font-family: inherit;
       text-transform: uppercase;
       color: #1c1f16;
       background: #8a9a55;
-      border: none;
-      border-radius: 4px;
+      border: 4px solid #1c1f16;
+      border-radius: 0;
+      box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.6);
       cursor: pointer;
     }
     #join-btn:hover {
@@ -117,8 +158,17 @@
       <div id="join-overlay">
         <form id="join-panel">
           <h2>Enlist</h2>
-          <input id="join-name" type="text" maxlength="12" placeholder="Your name" autocomplete="off" autofocus />
-          <div class="swatch-row">
+          <div class="opt-row" id="mode-row">
+            <button type="button" class="opt-btn selected" id="mode-classic">Classic (turn-based)</button>
+            <button type="button" class="opt-btn" id="mode-chaos">Chaos (free-for-all)</button>
+          </div>
+          <div class="opt-row" id="pc-row">
+            <span class="row-label">Players on this device:</span>
+            <button type="button" class="opt-btn selected" data-pc="1">1</button>
+            <button type="button" class="opt-btn" data-pc="2">2</button>
+          </div>
+          <input id="join-name" class="name-input" type="text" maxlength="12" placeholder="Player 1 name" autocomplete="off" autofocus />
+          <div class="swatch-row" id="swatch-row1">
             <button type="button" class="swatch selected" data-color="#7a8b3f" style="background:#7a8b3f" title="Olive"></button>
             <button type="button" class="swatch" data-color="#5d7a8c" style="background:#5d7a8c" title="Field gray"></button>
             <button type="button" class="swatch" data-color="#b0803f" style="background:#b0803f" title="Desert tan"></button>
@@ -126,7 +176,11 @@
             <button type="button" class="swatch" data-color="#46606e" style="background:#46606e" title="Navy"></button>
             <button type="button" class="swatch" data-color="#55613a" style="background:#55613a" title="Dark olive"></button>
             <span class="swatch-label">custom</span>
-            <input id="join-custom" type="color" value="#7a8b3f" title="Custom color" />
+            <input id="join-custom" class="custom-color" type="color" value="#7a8b3f" title="Custom color" />
+          </div>
+          <div id="p2-extra">
+            <input id="join-name2" class="name-input" type="text" maxlength="12" placeholder="Player 2 name" autocomplete="off" />
+            <div class="swatch-row" id="swatch-row2"></div>
           </div>
           <button id="join-btn" type="submit">Join Battle</button>
         </form>
@@ -135,8 +189,8 @@
     <p class="help">
       Move: <b>A/D</b> or <b>&larr;/&rarr;</b> &nbsp;|&nbsp;
       Aim: <b>W/S</b> or <b>&uarr;/&darr;</b> &nbsp;|&nbsp;
-      Fire: hold <b>Space</b> to charge, release to shoot &nbsp;|&nbsp;
-      Turn-based: firing ends your turn
+      Fire: hold <b>Space</b>, release to shoot &nbsp;|&nbsp;
+      Weapon: <b>1-5</b> or <b>Q</b> to cycle
     </p>
   </div>
   <script src="sounds.js"></script>

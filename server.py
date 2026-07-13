@@ -37,6 +37,30 @@ EXPLOSION_RADIUS = 46
 MAX_DAMAGE = 45
 RESET_DELAY = 3.0
 
+MG_POWER = 520
+BURST_SIZE = 8
+BURST_INTERVAL = 0.08
+CHAOS_MG_INTERVAL = 0.15
+
+# per-weapon explosion radius / max damage
+WEAPONS = {
+    'basic':   {'radius': EXPLOSION_RADIUS, 'damage': MAX_DAMAGE},
+    'tnt':     {'radius': 80, 'damage': 75},
+    'scatter': {'radius': 20, 'damage': 14},
+    'flame':   {'radius': 15, 'damage': 10},
+    'mg':      {'radius': 8,  'damage': 6},
+}
+CHAOS_COOLDOWNS = {'basic': 1.2, 'tnt': 3.0, 'scatter': 2.0, 'flame': 2.5, 'mg': CHAOS_MG_INTERVAL}
+AMMO_WEAPONS = ('tnt', 'scatter', 'flame', 'mg')
+STARTING_AMMO = {'tnt': 1, 'scatter': 1, 'flame': 1, 'mg': 30}
+
+CRATE_INTERVAL = 7.0
+MAX_CRATES = 5
+CRATE_PICKUP_DIST = 26
+FIRE_TTL = 4.0
+FIRE_RADIUS = 28
+FIRE_DPS = 8.0
+
 COLORS = ['#7a8b3f', '#5d7a8c', '#b0803f', '#7d5a5a']  # olive, field gray, desert tan, maroon
 
 state_lock = threading.Lock()
@@ -49,6 +73,10 @@ winner = None
 reset_at = None
 current_turn = None   # player id whose turn it is
 turn_phase = 'aim'    # 'aim' while waiting for the shot, 'firing' while shell in flight
+mode = None           # 'classic' | 'chaos'; set by the first player to join, unset when empty
+crates = []           # [{'x', 'y', 'kind'}]
+fires = []            # [{'x', 'y', 'ttl'}]
+last_crate_spawn = time.monotonic()
 
 
 def generate_terrain():
@@ -100,14 +128,22 @@ def make_player(pid):
         'alive': True,
         'input': {'left': False, 'right': False, 'up': False, 'down': False, 'space': False},
         'prev_space': False,
+        'weapon': 'basic',
+        'ammo': dict(STARTING_AMMO),
+        'wcd': {},            # chaos per-weapon cooldowns: weapon -> seconds remaining
+        'pending_burst': 0,   # classic mg burst bullets left to fire
+        'burst_timer': 0.0,
     }
 
 
 def reset_round():
-    global terrain, terrain_changed, winner, reset_at, current_turn, turn_phase
+    global terrain, terrain_changed, winner, reset_at, current_turn, turn_phase, last_crate_spawn
     terrain = generate_terrain()
     terrain_changed = True
     projectiles.clear()
+    crates.clear()
+    fires.clear()
+    last_crate_spawn = time.monotonic()
     winner = None
     reset_at = None
     for p in players.values():
@@ -118,6 +154,11 @@ def reset_round():
         p['cooldown'] = 0.0
         p['hp'] = 100
         p['alive'] = True
+        p['weapon'] = 'basic'
+        p['ammo'] = dict(STARTING_AMMO)
+        p['wcd'] = {}
+        p['pending_burst'] = 0
+        p['burst_timer'] = 0.0
     ids = sorted(p['id'] for p in players.values())
     current_turn = ids[0] if ids else None
     turn_phase = 'aim'
@@ -134,16 +175,16 @@ def advance_turn():
     current_turn = later[0] if later else alive[0]
 
 
-def explode(x, y):
+def explode(x, y, radius=EXPLOSION_RADIUS, max_damage=MAX_DAMAGE):
     global terrain_changed
-    lo = max(0, math.floor(x - EXPLOSION_RADIUS))
-    hi = min(WIDTH, math.ceil(x + EXPLOSION_RADIUS))
+    lo = max(0, math.floor(x - radius))
+    hi = min(WIDTH, math.ceil(x + radius))
     for px in range(lo, hi + 1):
         dx = px - x
-        falloff = 1 - abs(dx) / EXPLOSION_RADIUS
+        falloff = 1 - abs(dx) / radius
         if falloff <= 0:
             continue
-        terrain[px] = min(HEIGHT - 20, terrain[px] + falloff * EXPLOSION_RADIUS * 0.9)
+        terrain[px] = min(HEIGHT - 20, terrain[px] + falloff * radius * 0.9)
     terrain_changed = True
 
     for p in players.values():
@@ -151,23 +192,81 @@ def explode(x, y):
             continue
         tank_y = terrain_height_at(p['x']) - TANK_RADIUS
         dist = math.hypot(p['x'] - x, tank_y - y)
-        if dist < EXPLOSION_RADIUS:
-            dmg = MAX_DAMAGE * (1 - dist / EXPLOSION_RADIUS)
+        if dist < radius:
+            dmg = max_damage * (1 - dist / radius)
             p['hp'] -= dmg
             if p['hp'] <= 0:
                 p['hp'] = 0
                 p['alive'] = False
 
 
+def consume_ammo(p, weapon):
+    """Spend 1 ammo; auto-switch to basic when the weapon runs dry."""
+    if weapon == 'basic':
+        return
+    p['ammo'][weapon] = max(0, p['ammo'][weapon] - 1)
+    if p['ammo'][weapon] <= 0 and p['weapon'] == weapon:
+        p['weapon'] = 'basic'
+
+
+def fire_projectile(p, angle_deg, power, kind):
+    rad = math.radians(angle_deg)
+    barrel_len = TANK_RADIUS + 14
+    origin_x = p['x'] + barrel_len * math.cos(rad)
+    origin_y = terrain_height_at(p['x']) - TANK_RADIUS - barrel_len * math.sin(rad)
+    projectiles.append({
+        'x': origin_x,
+        'y': origin_y,
+        'vx': power * math.cos(rad),
+        'vy': -power * math.sin(rad),
+        'owner': p['id'],
+        'kind': kind,
+    })
+
+
+def fire_charged(p):
+    """Release a charged shot with the player's current weapon (all but mg)."""
+    global turn_phase
+    weapon = p['weapon']
+    if weapon != 'basic' and p['ammo'].get(weapon, 0) <= 0:
+        p['weapon'] = 'basic'
+        weapon = 'basic'
+    if weapon == 'scatter':
+        for _ in range(6):
+            ang = p['angle'] + random.uniform(-8, 8)
+            pw = p['power'] * random.uniform(0.9, 1.1)
+            fire_projectile(p, ang, pw, 'scatter')
+    else:
+        fire_projectile(p, p['angle'], p['power'], weapon)
+    consume_ammo(p, weapon)
+    p['charging'] = False
+    p['power'] = MIN_POWER
+    if mode == 'chaos':
+        p['wcd'][weapon] = CHAOS_COOLDOWNS[weapon]
+    else:
+        p['cooldown'] = FIRE_COOLDOWN
+        if len(players) >= 2:
+            turn_phase = 'firing'
+
+
 def tick():
-    global winner, reset_at, turn_phase
+    global winner, reset_at, turn_phase, last_crate_spawn
     dt = TICK
+    chaos = (mode == 'chaos')
 
     for p in players.values():
+        # cooldowns tick down regardless of turn
+        if p['cooldown'] > 0:
+            p['cooldown'] -= dt
+        for w in list(p['wcd']):
+            p['wcd'][w] -= dt
+            if p['wcd'][w] <= 0:
+                del p['wcd'][w]
+
         if not p['alive']:
             continue
-        # solo player gets free practice; otherwise only the active player acts
-        my_turn = len(players) < 2 or (p['id'] == current_turn and turn_phase == 'aim')
+        # chaos: everyone acts; classic: solo free practice or the active player only
+        my_turn = chaos or len(players) < 2 or (p['id'] == current_turn and turn_phase == 'aim')
         if not my_turn:
             p['charging'] = False
             p['prev_space'] = p['input']['space']
@@ -185,35 +284,53 @@ def tick():
         if inp['down']:
             p['angle'] = max(0, p['angle'] - ANGLE_SPEED * dt)
 
-        if p['cooldown'] > 0:
-            p['cooldown'] -= dt
-
-        if inp['space'] and p['cooldown'] <= 0:
-            if not p['charging']:
-                p['charging'] = True
-                p['charge_start'] = time.monotonic()
-                p['power'] = MIN_POWER
-            else:
-                elapsed = time.monotonic() - p['charge_start']
-                p['power'] = min(MAX_POWER, MIN_POWER + elapsed * CHARGE_RATE)
-        elif not inp['space'] and p['prev_space'] and p['charging']:
-            rad = math.radians(p['angle'])
-            barrel_len = TANK_RADIUS + 14
-            origin_x = p['x'] + barrel_len * math.cos(rad)
-            origin_y = terrain_height_at(p['x']) - TANK_RADIUS - barrel_len * math.sin(rad)
-            projectiles.append({
-                'x': origin_x,
-                'y': origin_y,
-                'vx': p['power'] * math.cos(rad),
-                'vy': -p['power'] * math.sin(rad),
-                'owner': p['id'],
-            })
+        if p['weapon'] == 'mg':
             p['charging'] = False
-            p['power'] = MIN_POWER
-            p['cooldown'] = FIRE_COOLDOWN
-            if len(players) >= 2:
-                turn_phase = 'firing'
+            if chaos:
+                # hold to spray: one bullet per cooldown interval
+                if inp['space'] and p['wcd'].get('mg', 0) <= 0 and p['ammo']['mg'] > 0:
+                    fire_projectile(p, p['angle'], MG_POWER, 'mg')
+                    consume_ammo(p, 'mg')
+                    p['wcd']['mg'] = CHAOS_COOLDOWNS['mg']
+            else:
+                # classic: burst on release, server-timed
+                if (not inp['space'] and p['prev_space'] and p['cooldown'] <= 0
+                        and p['pending_burst'] == 0 and p['ammo']['mg'] > 0):
+                    p['pending_burst'] = BURST_SIZE
+                    p['burst_timer'] = 0.0
+                    p['cooldown'] = FIRE_COOLDOWN
+                    if len(players) >= 2:
+                        turn_phase = 'firing'
+        else:
+            can_start = (p['wcd'].get(p['weapon'], 0) <= 0) if chaos else (p['cooldown'] <= 0)
+            if inp['space'] and (p['charging'] or can_start):
+                if not p['charging']:
+                    p['charging'] = True
+                    p['charge_start'] = time.monotonic()
+                    p['power'] = MIN_POWER
+                else:
+                    elapsed = time.monotonic() - p['charge_start']
+                    p['power'] = min(MAX_POWER, MIN_POWER + elapsed * CHARGE_RATE)
+            elif not inp['space'] and p['prev_space'] and p['charging']:
+                fire_charged(p)
         p['prev_space'] = inp['space']
+
+    # classic mg bursts continue even after turn_phase leaves 'aim'
+    for p in players.values():
+        if p['pending_burst'] <= 0:
+            continue
+        if not p['alive']:
+            p['pending_burst'] = 0
+            continue
+        p['burst_timer'] -= dt
+        while p['pending_burst'] > 0 and p['burst_timer'] <= 0:
+            if p['ammo']['mg'] <= 0:
+                p['pending_burst'] = 0
+                break
+            fire_projectile(p, p['angle'], MG_POWER, 'mg')
+            consume_ammo(p, 'mg')
+            p['pending_burst'] -= 1
+            p['burst_timer'] += BURST_INTERVAL
 
     for proj in projectiles[:]:
         proj['vy'] += GRAVITY * dt
@@ -235,10 +352,54 @@ def tick():
                     break
 
         if hit:
-            explode(max(0, min(WIDTH, proj['x'])), min(HEIGHT, proj['y']))
+            kind = proj.get('kind', 'basic')
+            spec = WEAPONS.get(kind, WEAPONS['basic'])
+            ix = max(0, min(WIDTH, proj['x']))
+            iy = min(HEIGHT, proj['y'])
+            explode(ix, iy, spec['radius'], spec['damage'])
+            if kind == 'flame':
+                for _ in range(10):
+                    fx = max(0, min(WIDTH, ix + random.uniform(-40, 40)))
+                    fires.append({'x': fx, 'y': terrain_height_at(fx), 'ttl': FIRE_TTL})
             projectiles.remove(proj)
 
-    if turn_phase == 'firing' and not projectiles:
+    # fire cells: ride the (deforming) terrain, expire; burn any tank near a fire
+    for f in fires[:]:
+        f['ttl'] -= dt
+        if f['ttl'] <= 0:
+            fires.remove(f)
+            continue
+        f['y'] = terrain_height_at(f['x'])
+    if fires:
+        for p in players.values():
+            if not p['alive']:
+                continue
+            tank_y = terrain_height_at(p['x']) - TANK_RADIUS
+            if any(math.hypot(p['x'] - f['x'], tank_y - f['y']) < FIRE_RADIUS for f in fires):
+                p['hp'] -= FIRE_DPS * dt
+                if p['hp'] <= 0:
+                    p['hp'] = 0
+                    p['alive'] = False
+
+    # ammo crates: periodic spawn, glue to terrain, pickup by proximity
+    now = time.monotonic()
+    if now - last_crate_spawn >= CRATE_INTERVAL:
+        last_crate_spawn = now
+        if len(crates) < MAX_CRATES:
+            cx = random.uniform(60, WIDTH - 60)
+            crates.append({'x': cx, 'y': terrain_height_at(cx),
+                           'kind': random.choice(['tnt', 'scatter', 'flame', 'mg'])})
+    for c in crates[:]:
+        c['y'] = terrain_height_at(c['x'])
+        for p in players.values():
+            if p['alive'] and abs(p['x'] - c['x']) < CRATE_PICKUP_DIST:
+                c_kind = c['kind']
+                p['ammo'][c_kind] += 25 if c_kind == 'mg' else 2
+                crates.remove(c)
+                break
+
+    if (not chaos and turn_phase == 'firing' and not projectiles
+            and not any(p['pending_burst'] > 0 for p in players.values())):
         advance_turn()
 
     if winner is None and reset_at is None and len(players) >= 2:
@@ -260,7 +421,8 @@ def broadcast():
         'type': 'state',
         'winner': winner,
         'playerCount': len(players),
-        'currentTurn': current_turn,
+        'mode': mode,
+        'currentTurn': None if mode == 'chaos' else current_turn,
         'turnPhase': turn_phase,
         'players': [{
             'id': p['id'],
@@ -273,8 +435,13 @@ def broadcast():
             'alive': p['alive'],
             'charging': p['charging'],
             'power': p['power'],
+            'weapon': p['weapon'],
+            'ammo': p['ammo'],
         } for p in players.values()],
-        'projectiles': [{'x': proj['x'], 'y': proj['y']} for proj in projectiles],
+        'projectiles': [{'x': proj['x'], 'y': proj['y'], 'kind': proj.get('kind', 'basic')}
+                        for proj in projectiles],
+        'crates': [{'x': c['x'], 'y': c['y'], 'kind': c['kind']} for c in crates],
+        'fires': [{'x': f['x'], 'y': f['y'], 'ttl': f['ttl']} for f in fires],
     }
     msg = json.dumps(state)
 
@@ -433,6 +600,11 @@ def handle_client(sock, addr):
         return
 
     with state_lock:
+        global mode
+        if not players:
+            # first player to join is the host and picks the mode
+            m = join_msg.get('mode')
+            mode = m if m in ('classic', 'chaos') else 'classic'
         pid = next_id
         next_id += 1
         player = make_player(pid)
@@ -447,7 +619,7 @@ def handle_client(sock, addr):
         if current_turn is None:
             current_turn = pid
         welcome = json.dumps({'type': 'welcome', 'id': pid, 'color': player['color'],
-                               'width': WIDTH, 'height': HEIGHT})
+                               'width': WIDTH, 'height': HEIGHT, 'mode': mode})
         terrain_msg = json.dumps({'type': 'terrain', 'terrain': terrain})
     try:
         conn.send_text(welcome)
@@ -472,6 +644,12 @@ def handle_client(sock, addr):
                     continue
                 if isinstance(data, dict) and data.get('type') == 'join':
                     continue  # already joined; ignore stray join messages
+                if isinstance(data, dict) and data.get('type') == 'weapon':
+                    w = data.get('weapon')
+                    with state_lock:
+                        if w == 'basic' or (w in AMMO_WEAPONS and player['ammo'].get(w, 0) > 0):
+                            player['weapon'] = w
+                    continue
                 with state_lock:
                     for k in ('left', 'right', 'up', 'down', 'space'):
                         if k in data:
@@ -483,6 +661,8 @@ def handle_client(sock, addr):
             players.pop(conn, None)
             if player['id'] == current_turn and turn_phase == 'aim':
                 advance_turn()
+            if not players:
+                mode = None  # next first joiner picks the mode again
         try:
             sock.close()
         except OSError:
