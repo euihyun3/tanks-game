@@ -158,6 +158,12 @@
       <div id="join-overlay">
         <form id="join-panel">
           <h2>Enlist</h2>
+          <div class="opt-row" id="room-row">
+            <button type="button" class="opt-btn selected" id="room-new">New room</button>
+            <button type="button" class="opt-btn" id="room-join">Join room</button>
+            <input id="room-code" class="name-input" type="text" maxlength="8" placeholder="CODE"
+                   autocomplete="off" style="display:none; width:90px; text-transform:uppercase;" />
+          </div>
           <div class="opt-row" id="mode-row">
             <button type="button" class="opt-btn selected" id="mode-classic">Classic (turn-based)</button>
             <button type="button" class="opt-btn" id="mode-chaos">Chaos (free-for-all)</button>

@@ -17,6 +17,7 @@ const tctx = tCan.getContext('2d');         // pre-rendered terrain buffer
 let terrain = null;
 let latestState = null;
 let serverMode = null;   // authoritative mode from the server's welcome
+let roomCode = null;     // room code assigned by the server's welcome
 
 function sizeBuffers() {
   LW = Math.round(W / SCALE);
@@ -37,7 +38,8 @@ const MIN_POWER = 220;
 const MAX_POWER = 620;
 const MG_POWER = 520; // mg has no charge; flies at fixed power
 
-const WS_PORT = 8081;
+// HTTP and WebSocket share one port now (works locally and on cloud hosts)
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
 
 const WEAPONS = ['basic', 'tnt', 'scatter', 'flame', 'mg'];
 const WEAPON_LABELS = { basic: 'BASIC', tnt: 'TNT', scatter: 'SCATTER', flame: 'FLAME', mg: 'MG' };
@@ -148,6 +150,29 @@ for (const m of ['classic', 'chaos']) {
   });
 }
 
+// room picker: create a fresh room or join by code
+const roomNewBtn = document.getElementById('room-new');
+const roomJoinBtn = document.getElementById('room-join');
+const roomCodeInput = document.getElementById('room-code');
+let roomChoice = 'new';
+
+function setRoomChoice(choice) {
+  roomChoice = choice;
+  roomNewBtn.classList.toggle('selected', choice === 'new');
+  roomJoinBtn.classList.toggle('selected', choice === 'join');
+  roomCodeInput.style.display = choice === 'join' ? '' : 'none';
+  if (choice === 'join') roomCodeInput.focus();
+}
+roomNewBtn.addEventListener('click', () => setRoomChoice('new'));
+roomJoinBtn.addEventListener('click', () => setRoomChoice('join'));
+
+// ?room=ABCD in the URL preselects join-with-code (shareable invite links)
+const urlRoom = new URLSearchParams(location.search).get('room');
+if (urlRoom) {
+  roomCodeInput.value = urlRoom.toUpperCase().slice(0, 8);
+  setRoomChoice('join');
+}
+
 // players-on-this-device picker
 const pcBtns = Array.from(document.querySelectorAll('#pc-row .opt-btn'));
 for (const btn of pcBtns) {
@@ -186,15 +211,17 @@ joinForm.addEventListener('submit', (e) => {
   setHelpText();
   overlayEl.style.display = 'none';
   statusEl.textContent = 'Connecting...';
-  for (const local of locals) connect(local);
+  // P1 connects first; P2 (if any) joins P1's room once the welcome names it
+  const requested = roomChoice === 'join' ? roomCodeInput.value.trim().toUpperCase() : '';
+  connect(locals[0], requested);
 });
 
-function connect(local) {
-  const sock = new WebSocket('ws://' + location.hostname + ':' + WS_PORT);
+function connect(local, room) {
+  const sock = new WebSocket(WS_URL);
   local.ws = sock;
 
   sock.onopen = () => {
-    sock.send(JSON.stringify({ type: 'join', name: local.name, color: local.color, mode: chosenMode }));
+    sock.send(JSON.stringify({ type: 'join', name: local.name, color: local.color, mode: chosenMode, room: room || '' }));
     if (local.slot === 0) statusEl.textContent = 'Connected. Waiting for another player...';
   };
   sock.onclose = () => {
@@ -207,6 +234,8 @@ function connect(local) {
       local.id = msg.id;
       local.color = msg.color;
       if (local.slot === 0) {
+        roomCode = msg.room || null;
+        if (locals[1] && !locals[1].ws) connect(locals[1], roomCode);
         serverMode = msg.mode || 'classic';
         if (msg.width && (msg.width !== W || msg.height !== H)) {
           W = msg.width;
@@ -296,7 +325,7 @@ function playerName(id) {
 function updateStatus(msg) {
   const tag = modeTag();
   if (msg.playerCount < 2) {
-    statusEl.textContent = tag + 'Waiting for another player to join...';
+    statusEl.textContent = tag + 'Waiting for players — room code: ' + (roomCode || '...');
     statusEl.className = '';
   } else if (msg.winner) {
     statusEl.textContent = '';
@@ -765,12 +794,16 @@ function drawHiRes() {
     }
   }
 
-  // server mode badge
+  // server mode + room badges
   if (serverMode) {
     vctx.font = 'bold 12px "Courier New", monospace';
     vctx.textAlign = 'right';
     vctx.fillStyle = '#20506b';
     vctx.fillText(serverMode.toUpperCase() + ' MODE', W - 10, 18);
+    if (roomCode) {
+      vctx.fillStyle = '#1a4258';
+      vctx.fillText('ROOM ' + roomCode, W - 10, 34);
+    }
     vctx.textAlign = 'center';
   }
 }

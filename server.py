@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-"""Local-network multiplayer artillery tanks with destructible terrain.
+"""Multiplayer artillery tanks with destructible terrain, room-based.
 
-Serves the game page over plain HTTP and runs a hand-rolled WebSocket
-server (stdlib only, no pip installs needed) for realtime game state.
+One stdlib-only socket server on a single port (PORT env var, default 8080)
+serves both the static game page over HTTP and the realtime game state over
+a hand-rolled WebSocket upgrade. Games are isolated in rooms keyed by a
+4-letter code.
 """
 import base64
 import hashlib
-import http.server
 import json
 import math
 import os
 import random
 import re
 import socket
-import socketserver
 import struct
 import threading
 import time
+from urllib.parse import unquote
 
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-HTTP_PORT = 8080
-WS_PORT = 8081
+PORT = int(os.environ.get('PORT', 8080))
+PUBLIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'public')
 
 WIDTH, HEIGHT = 1000, 600
 TICK = 1 / 30
@@ -63,20 +64,61 @@ FIRE_DPS = 8.0
 
 COLORS = ['#7a8b3f', '#5d7a8c', '#b0803f', '#7d5a5a']  # olive, field gray, desert tan, maroon
 
+ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ'  # no I/O to avoid confusion
+CONTENT_TYPES = {
+    '.html': 'text/html',
+    '.js': 'text/javascript',
+    '.css': 'text/css',
+}
+
+# ONE lock guards the rooms dict and all room state.
 state_lock = threading.Lock()
-players = {}          # conn -> player dict
-terrain = []
-terrain_changed = True
-projectiles = []
-next_id = 1
-winner = None
-reset_at = None
-current_turn = None   # player id whose turn it is
-turn_phase = 'aim'    # 'aim' while waiting for the shot, 'firing' while shell in flight
-mode = None           # 'classic' | 'chaos'; set by the first player to join, unset when empty
-crates = []           # [{'x', 'y', 'kind'}]
-fires = []            # [{'x', 'y', 'ttl'}]
-last_crate_spawn = time.monotonic()
+rooms = {}  # code -> room dict
+
+
+def new_room_code():
+    """Random unique 4-letter room code. Caller must hold state_lock."""
+    while True:
+        code = ''.join(random.choice(ROOM_ALPHABET) for _ in range(4))
+        if code not in rooms:
+            return code
+
+
+def make_room(code, mode_req=None):
+    return {
+        'code': code,
+        'players': {},        # conn -> player dict
+        'terrain': generate_terrain(),
+        'terrain_changed': True,
+        'projectiles': [],
+        'crates': [],         # [{'x', 'y', 'kind'}]
+        'fires': [],          # [{'x', 'y', 'ttl'}]
+        'next_id': 1,
+        'winner': None,
+        'reset_at': None,
+        'current_turn': None,  # player id whose turn it is
+        'turn_phase': 'aim',   # 'aim' while waiting for the shot, 'firing' while shell in flight
+        'mode': mode_req if mode_req in ('classic', 'chaos') else 'classic',
+        'last_crate_spawn': time.monotonic(),
+    }
+
+
+def get_or_create_room(code_raw, mode_req):
+    """Find or create the room for a join message. Caller must hold state_lock."""
+    code = ''
+    if code_raw is not None:
+        code = str(code_raw).strip().upper()[:8]
+    if code and code in rooms:
+        room = rooms[code]
+        if not room['players']:
+            # joining an empty room: joiner is effectively the host, picks the mode
+            room['mode'] = mode_req if mode_req in ('classic', 'chaos') else 'classic'
+        return room
+    if not code:
+        code = new_room_code()
+    room = make_room(code, mode_req)
+    rooms[code] = room
+    return room
 
 
 def generate_terrain():
@@ -98,13 +140,13 @@ def generate_terrain():
     return heights
 
 
-def terrain_height_at(x):
+def terrain_height_at(room, x):
     x = max(0, min(WIDTH, round(x)))
-    return terrain[x]
+    return room['terrain'][x]
 
 
-def spawn_position(taken=None):
-    taken = taken if taken is not None else [p['x'] for p in players.values()]
+def spawn_position(room, taken=None):
+    taken = taken if taken is not None else [p['x'] for p in room['players'].values()]
     for _ in range(40):
         x = WIDTH * (0.1 + 0.8 * random.random())
         if all(abs(x - t) >= 140 for t in taken):
@@ -112,13 +154,13 @@ def spawn_position(taken=None):
     return WIDTH * (0.1 + 0.8 * random.random())
 
 
-def make_player(pid):
-    idx = len(players)
+def make_player(room, pid):
+    idx = len(room['players'])
     return {
         'id': pid,
         'name': f'Player {pid}',
         'color': COLORS[idx % len(COLORS)],
-        'x': spawn_position(),
+        'x': spawn_position(room),
         'angle': 45.0,
         'power': MIN_POWER,
         'charging': False,
@@ -136,18 +178,17 @@ def make_player(pid):
     }
 
 
-def reset_round():
-    global terrain, terrain_changed, winner, reset_at, current_turn, turn_phase, last_crate_spawn
-    terrain = generate_terrain()
-    terrain_changed = True
-    projectiles.clear()
-    crates.clear()
-    fires.clear()
-    last_crate_spawn = time.monotonic()
-    winner = None
-    reset_at = None
-    for p in players.values():
-        p['x'] = spawn_position()
+def reset_round(room):
+    room['terrain'] = generate_terrain()
+    room['terrain_changed'] = True
+    room['projectiles'].clear()
+    room['crates'].clear()
+    room['fires'].clear()
+    room['last_crate_spawn'] = time.monotonic()
+    room['winner'] = None
+    room['reset_at'] = None
+    for p in room['players'].values():
+        p['x'] = spawn_position(room)
         p['angle'] = 45.0
         p['power'] = MIN_POWER
         p['charging'] = False
@@ -159,24 +200,23 @@ def reset_round():
         p['wcd'] = {}
         p['pending_burst'] = 0
         p['burst_timer'] = 0.0
-    ids = sorted(p['id'] for p in players.values())
-    current_turn = ids[0] if ids else None
-    turn_phase = 'aim'
+    ids = sorted(p['id'] for p in room['players'].values())
+    room['current_turn'] = ids[0] if ids else None
+    room['turn_phase'] = 'aim'
 
 
-def advance_turn():
-    global current_turn, turn_phase
-    alive = sorted(p['id'] for p in players.values() if p['alive'])
-    turn_phase = 'aim'
+def advance_turn(room):
+    alive = sorted(p['id'] for p in room['players'].values() if p['alive'])
+    room['turn_phase'] = 'aim'
     if not alive:
-        current_turn = None
+        room['current_turn'] = None
         return
-    later = [i for i in alive if current_turn is not None and i > current_turn]
-    current_turn = later[0] if later else alive[0]
+    later = [i for i in alive if room['current_turn'] is not None and i > room['current_turn']]
+    room['current_turn'] = later[0] if later else alive[0]
 
 
-def explode(x, y, radius=EXPLOSION_RADIUS, max_damage=MAX_DAMAGE):
-    global terrain_changed
+def explode(room, x, y, radius=EXPLOSION_RADIUS, max_damage=MAX_DAMAGE):
+    terrain = room['terrain']
     lo = max(0, math.floor(x - radius))
     hi = min(WIDTH, math.ceil(x + radius))
     for px in range(lo, hi + 1):
@@ -185,12 +225,12 @@ def explode(x, y, radius=EXPLOSION_RADIUS, max_damage=MAX_DAMAGE):
         if falloff <= 0:
             continue
         terrain[px] = min(HEIGHT - 20, terrain[px] + falloff * radius * 0.9)
-    terrain_changed = True
+    room['terrain_changed'] = True
 
-    for p in players.values():
+    for p in room['players'].values():
         if not p['alive']:
             continue
-        tank_y = terrain_height_at(p['x']) - TANK_RADIUS
+        tank_y = terrain_height_at(room, p['x']) - TANK_RADIUS
         dist = math.hypot(p['x'] - x, tank_y - y)
         if dist < radius:
             dmg = max_damage * (1 - dist / radius)
@@ -209,12 +249,12 @@ def consume_ammo(p, weapon):
         p['weapon'] = 'basic'
 
 
-def fire_projectile(p, angle_deg, power, kind):
+def fire_projectile(room, p, angle_deg, power, kind):
     rad = math.radians(angle_deg)
     barrel_len = TANK_RADIUS + 14
     origin_x = p['x'] + barrel_len * math.cos(rad)
-    origin_y = terrain_height_at(p['x']) - TANK_RADIUS - barrel_len * math.sin(rad)
-    projectiles.append({
+    origin_y = terrain_height_at(room, p['x']) - TANK_RADIUS - barrel_len * math.sin(rad)
+    room['projectiles'].append({
         'x': origin_x,
         'y': origin_y,
         'vx': power * math.cos(rad),
@@ -224,9 +264,8 @@ def fire_projectile(p, angle_deg, power, kind):
     })
 
 
-def fire_charged(p):
+def fire_charged(room, p):
     """Release a charged shot with the player's current weapon (all but mg)."""
-    global turn_phase
     weapon = p['weapon']
     if weapon != 'basic' and p['ammo'].get(weapon, 0) <= 0:
         p['weapon'] = 'basic'
@@ -235,24 +274,27 @@ def fire_charged(p):
         for _ in range(6):
             ang = p['angle'] + random.uniform(-8, 8)
             pw = p['power'] * random.uniform(0.9, 1.1)
-            fire_projectile(p, ang, pw, 'scatter')
+            fire_projectile(room, p, ang, pw, 'scatter')
     else:
-        fire_projectile(p, p['angle'], p['power'], weapon)
+        fire_projectile(room, p, p['angle'], p['power'], weapon)
     consume_ammo(p, weapon)
     p['charging'] = False
     p['power'] = MIN_POWER
-    if mode == 'chaos':
+    if room['mode'] == 'chaos':
         p['wcd'][weapon] = CHAOS_COOLDOWNS[weapon]
     else:
         p['cooldown'] = FIRE_COOLDOWN
-        if len(players) >= 2:
-            turn_phase = 'firing'
+        if len(room['players']) >= 2:
+            room['turn_phase'] = 'firing'
 
 
-def tick():
-    global winner, reset_at, turn_phase, last_crate_spawn
+def tick(room):
     dt = TICK
-    chaos = (mode == 'chaos')
+    chaos = (room['mode'] == 'chaos')
+    players = room['players']
+    projectiles = room['projectiles']
+    crates = room['crates']
+    fires = room['fires']
 
     for p in players.values():
         # cooldowns tick down regardless of turn
@@ -266,7 +308,8 @@ def tick():
         if not p['alive']:
             continue
         # chaos: everyone acts; classic: solo free practice or the active player only
-        my_turn = chaos or len(players) < 2 or (p['id'] == current_turn and turn_phase == 'aim')
+        my_turn = chaos or len(players) < 2 or (
+            p['id'] == room['current_turn'] and room['turn_phase'] == 'aim')
         if not my_turn:
             p['charging'] = False
             p['prev_space'] = p['input']['space']
@@ -289,7 +332,7 @@ def tick():
             if chaos:
                 # hold to spray: one bullet per cooldown interval
                 if inp['space'] and p['wcd'].get('mg', 0) <= 0 and p['ammo']['mg'] > 0:
-                    fire_projectile(p, p['angle'], MG_POWER, 'mg')
+                    fire_projectile(room, p, p['angle'], MG_POWER, 'mg')
                     consume_ammo(p, 'mg')
                     p['wcd']['mg'] = CHAOS_COOLDOWNS['mg']
             else:
@@ -300,7 +343,7 @@ def tick():
                     p['burst_timer'] = 0.0
                     p['cooldown'] = FIRE_COOLDOWN
                     if len(players) >= 2:
-                        turn_phase = 'firing'
+                        room['turn_phase'] = 'firing'
         else:
             can_start = (p['wcd'].get(p['weapon'], 0) <= 0) if chaos else (p['cooldown'] <= 0)
             if inp['space'] and (p['charging'] or can_start):
@@ -312,7 +355,7 @@ def tick():
                     elapsed = time.monotonic() - p['charge_start']
                     p['power'] = min(MAX_POWER, MIN_POWER + elapsed * CHARGE_RATE)
             elif not inp['space'] and p['prev_space'] and p['charging']:
-                fire_charged(p)
+                fire_charged(room, p)
         p['prev_space'] = inp['space']
 
     # classic mg bursts continue even after turn_phase leaves 'aim'
@@ -327,7 +370,7 @@ def tick():
             if p['ammo']['mg'] <= 0:
                 p['pending_burst'] = 0
                 break
-            fire_projectile(p, p['angle'], MG_POWER, 'mg')
+            fire_projectile(room, p, p['angle'], MG_POWER, 'mg')
             consume_ammo(p, 'mg')
             p['pending_burst'] -= 1
             p['burst_timer'] += BURST_INTERVAL
@@ -340,13 +383,13 @@ def tick():
         hit = False
         if proj['x'] < 0 or proj['x'] > WIDTH or proj['y'] > HEIGHT:
             hit = True
-        elif proj['y'] >= terrain_height_at(proj['x']):
+        elif proj['y'] >= terrain_height_at(room, proj['x']):
             hit = True
         else:
             for p in players.values():
                 if not p['alive']:
                     continue
-                tank_y = terrain_height_at(p['x']) - TANK_RADIUS
+                tank_y = terrain_height_at(room, p['x']) - TANK_RADIUS
                 if math.hypot(proj['x'] - p['x'], proj['y'] - tank_y) < TANK_RADIUS:
                     hit = True
                     break
@@ -356,11 +399,11 @@ def tick():
             spec = WEAPONS.get(kind, WEAPONS['basic'])
             ix = max(0, min(WIDTH, proj['x']))
             iy = min(HEIGHT, proj['y'])
-            explode(ix, iy, spec['radius'], spec['damage'])
+            explode(room, ix, iy, spec['radius'], spec['damage'])
             if kind == 'flame':
                 for _ in range(10):
                     fx = max(0, min(WIDTH, ix + random.uniform(-40, 40)))
-                    fires.append({'x': fx, 'y': terrain_height_at(fx), 'ttl': FIRE_TTL})
+                    fires.append({'x': fx, 'y': terrain_height_at(room, fx), 'ttl': FIRE_TTL})
             projectiles.remove(proj)
 
     # fire cells: ride the (deforming) terrain, expire; burn any tank near a fire
@@ -369,12 +412,12 @@ def tick():
         if f['ttl'] <= 0:
             fires.remove(f)
             continue
-        f['y'] = terrain_height_at(f['x'])
+        f['y'] = terrain_height_at(room, f['x'])
     if fires:
         for p in players.values():
             if not p['alive']:
                 continue
-            tank_y = terrain_height_at(p['x']) - TANK_RADIUS
+            tank_y = terrain_height_at(room, p['x']) - TANK_RADIUS
             if any(math.hypot(p['x'] - f['x'], tank_y - f['y']) < FIRE_RADIUS for f in fires):
                 p['hp'] -= FIRE_DPS * dt
                 if p['hp'] <= 0:
@@ -383,14 +426,14 @@ def tick():
 
     # ammo crates: periodic spawn, glue to terrain, pickup by proximity
     now = time.monotonic()
-    if now - last_crate_spawn >= CRATE_INTERVAL:
-        last_crate_spawn = now
+    if now - room['last_crate_spawn'] >= CRATE_INTERVAL:
+        room['last_crate_spawn'] = now
         if len(crates) < MAX_CRATES:
             cx = random.uniform(60, WIDTH - 60)
-            crates.append({'x': cx, 'y': terrain_height_at(cx),
+            crates.append({'x': cx, 'y': terrain_height_at(room, cx),
                            'kind': random.choice(['tnt', 'scatter', 'flame', 'mg'])})
     for c in crates[:]:
-        c['y'] = terrain_height_at(c['x'])
+        c['y'] = terrain_height_at(room, c['x'])
         for p in players.values():
             if p['alive'] and abs(p['x'] - c['x']) < CRATE_PICKUP_DIST:
                 c_kind = c['kind']
@@ -398,38 +441,39 @@ def tick():
                 crates.remove(c)
                 break
 
-    if (not chaos and turn_phase == 'firing' and not projectiles
+    if (not chaos and room['turn_phase'] == 'firing' and not projectiles
             and not any(p['pending_burst'] > 0 for p in players.values())):
-        advance_turn()
+        advance_turn(room)
 
-    if winner is None and reset_at is None and len(players) >= 2:
+    if room['winner'] is None and room['reset_at'] is None and len(players) >= 2:
         alive = [p for p in players.values() if p['alive']]
         if len(alive) == 1:
-            winner = alive[0]['id']
-            reset_at = time.monotonic() + RESET_DELAY
+            room['winner'] = alive[0]['id']
+            room['reset_at'] = time.monotonic() + RESET_DELAY
         elif len(alive) == 0:
-            winner = 'draw'
-            reset_at = time.monotonic() + RESET_DELAY
+            room['winner'] = 'draw'
+            room['reset_at'] = time.monotonic() + RESET_DELAY
 
-    if reset_at is not None and time.monotonic() >= reset_at:
-        reset_round()
+    if room['reset_at'] is not None and time.monotonic() >= room['reset_at']:
+        reset_round(room)
 
 
-def broadcast():
-    global terrain_changed
+def broadcast(room):
+    players = room['players']
     state = {
         'type': 'state',
-        'winner': winner,
+        'room': room['code'],
+        'winner': room['winner'],
         'playerCount': len(players),
-        'mode': mode,
-        'currentTurn': None if mode == 'chaos' else current_turn,
-        'turnPhase': turn_phase,
+        'mode': room['mode'],
+        'currentTurn': None if room['mode'] == 'chaos' else room['current_turn'],
+        'turnPhase': room['turn_phase'],
         'players': [{
             'id': p['id'],
             'name': p['name'],
             'color': p['color'],
             'x': p['x'],
-            'y': terrain_height_at(p['x']) - TANK_RADIUS,
+            'y': terrain_height_at(room, p['x']) - TANK_RADIUS,
             'angle': p['angle'],
             'hp': p['hp'],
             'alive': p['alive'],
@@ -439,16 +483,16 @@ def broadcast():
             'ammo': p['ammo'],
         } for p in players.values()],
         'projectiles': [{'x': proj['x'], 'y': proj['y'], 'kind': proj.get('kind', 'basic')}
-                        for proj in projectiles],
-        'crates': [{'x': c['x'], 'y': c['y'], 'kind': c['kind']} for c in crates],
-        'fires': [{'x': f['x'], 'y': f['y'], 'ttl': f['ttl']} for f in fires],
+                        for proj in room['projectiles']],
+        'crates': [{'x': c['x'], 'y': c['y'], 'kind': c['kind']} for c in room['crates']],
+        'fires': [{'x': f['x'], 'y': f['y'], 'ttl': f['ttl']} for f in room['fires']],
     }
     msg = json.dumps(state)
 
     terrain_msg = None
-    if terrain_changed:
-        terrain_msg = json.dumps({'type': 'terrain', 'terrain': terrain})
-        terrain_changed = False
+    if room['terrain_changed']:
+        terrain_msg = json.dumps({'type': 'terrain', 'terrain': room['terrain']})
+        room['terrain_changed'] = False
 
     dead = []
     for conn, p in players.items():
@@ -466,8 +510,14 @@ def game_loop():
     next_tick = time.monotonic()
     while True:
         with state_lock:
-            tick()
-            broadcast()
+            for code in list(rooms):
+                room = rooms[code]
+                if not room['players']:
+                    # defensive sweep; normally deleted when the last player leaves
+                    del rooms[code]
+                    continue
+                tick(room)
+                broadcast(room)
         next_tick += TICK
         delay = next_tick - time.monotonic()
         if delay > 0:
@@ -477,6 +527,26 @@ def game_loop():
 
 
 # --- minimal WebSocket implementation (stdlib only) ---
+
+class BufferedSocket:
+    """Socket wrapper that replays bytes read past the HTTP head first."""
+
+    def __init__(self, sock, initial=b''):
+        self.sock = sock
+        self.buf = initial
+
+    def recv(self, n):
+        if self.buf:
+            chunk, self.buf = self.buf[:n], self.buf[n:]
+            return chunk
+        return self.sock.recv(n)
+
+    def sendall(self, data):
+        self.sock.sendall(data)
+
+    def close(self):
+        self.sock.close()
+
 
 def recv_exact(sock, n):
     buf = b''
@@ -540,16 +610,10 @@ class WSConnection:
             self.sock.sendall(data)
 
 
-def do_handshake(sock) -> bool:
-    data = b''
-    while b'\r\n\r\n' not in data:
-        chunk = sock.recv(2048)
-        if not chunk:
-            return False
-        data += chunk
-    headers = data.decode('utf-8', errors='ignore')
+def do_handshake(sock, header_text) -> bool:
+    """Complete the WS handshake using the already-read HTTP request head."""
     key = None
-    for line in headers.split('\r\n'):
+    for line in header_text.split('\r\n'):
         if line.lower().startswith('sec-websocket-key'):
             key = line.split(':', 1)[1].strip()
             break
@@ -566,12 +630,45 @@ def do_handshake(sock) -> bool:
     return True
 
 
-def handle_client(sock, addr):
-    global next_id
-    if not do_handshake(sock):
-        sock.close()
-        return
+def join_room(conn, join_msg):
+    """Create/find the room for a join message and add the new player to it.
 
+    Caller must hold state_lock. Returns (room, player, welcome_json, terrain_json).
+    """
+    room = get_or_create_room(join_msg.get('room'), join_msg.get('mode'))
+    pid = room['next_id']
+    room['next_id'] += 1
+    player = make_player(room, pid)
+    name = str(join_msg.get('name', '') or '').strip()[:12]
+    player['name'] = name if name else f'Player {pid}'
+    color = join_msg.get('color')
+    if isinstance(color, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', color):
+        player['color'] = color
+    room['players'][conn] = player
+    room['terrain_changed'] = True
+    if room['current_turn'] is None:
+        room['current_turn'] = pid
+    welcome = json.dumps({'type': 'welcome', 'id': pid, 'color': player['color'],
+                          'width': WIDTH, 'height': HEIGHT,
+                          'mode': room['mode'], 'room': room['code']})
+    terrain_msg = json.dumps({'type': 'terrain', 'terrain': room['terrain']})
+    return room, player, welcome, terrain_msg
+
+
+def leave_room(conn, room, player):
+    """Remove a player from its room; delete the room when empty.
+
+    Caller must hold state_lock.
+    """
+    room['players'].pop(conn, None)
+    if player['id'] == room['current_turn'] and room['turn_phase'] == 'aim':
+        advance_turn(room)
+    if not room['players']:
+        rooms.pop(room['code'], None)
+
+
+def handle_ws_client(sock):
+    """Run the per-client WS loop. `sock` is a BufferedSocket, handshake done."""
     conn = WSConnection(sock)
 
     # wait for a valid join message before creating the player
@@ -600,33 +697,13 @@ def handle_client(sock, addr):
         return
 
     with state_lock:
-        global mode
-        if not players:
-            # first player to join is the host and picks the mode
-            m = join_msg.get('mode')
-            mode = m if m in ('classic', 'chaos') else 'classic'
-        pid = next_id
-        next_id += 1
-        player = make_player(pid)
-        name = str(join_msg.get('name', '') or '').strip()[:12]
-        player['name'] = name if name else f'Player {pid}'
-        color = join_msg.get('color')
-        if isinstance(color, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', color):
-            player['color'] = color
-        players[conn] = player
-        global terrain_changed, current_turn
-        terrain_changed = True
-        if current_turn is None:
-            current_turn = pid
-        welcome = json.dumps({'type': 'welcome', 'id': pid, 'color': player['color'],
-                               'width': WIDTH, 'height': HEIGHT, 'mode': mode})
-        terrain_msg = json.dumps({'type': 'terrain', 'terrain': terrain})
+        room, player, welcome, terrain_msg = join_room(conn, join_msg)
     try:
         conn.send_text(welcome)
         conn.send_text(terrain_msg)
     except OSError:
         with state_lock:
-            players.pop(conn, None)
+            leave_room(conn, room, player)
         sock.close()
         return
 
@@ -658,38 +735,100 @@ def handle_client(sock, addr):
         pass
     finally:
         with state_lock:
-            players.pop(conn, None)
-            if player['id'] == current_turn and turn_phase == 'aim':
-                advance_turn()
-            if not players:
-                mode = None  # next first joiner picks the mode again
+            leave_room(conn, room, player)
         try:
             sock.close()
         except OSError:
             pass
 
 
-def ws_server():
+# --- single-port HTTP + WebSocket dispatch ---
+
+def resolve_static_path(url_path):
+    """Map a request path to a real file path inside PUBLIC_DIR, or None."""
+    path = url_path.split('?', 1)[0].split('#', 1)[0]
+    path = unquote(path)
+    if path == '/':
+        path = '/index.html'
+    root = os.path.realpath(PUBLIC_DIR)
+    full = os.path.realpath(os.path.join(root, path.lstrip('/')))
+    if full != root and not full.startswith(root + os.sep):
+        return None  # path traversal attempt
+    return full
+
+
+def send_http_response(sock, status, body=b'', content_type='text/plain'):
+    head = (
+        f"HTTP/1.1 {status}\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    sock.sendall(head.encode() + body)
+
+
+def serve_static(sock, request_line):
+    parts = request_line.split()
+    if len(parts) < 2:
+        send_http_response(sock, '400 Bad Request', b'Bad Request')
+        return
+    method, target = parts[0], parts[1]
+    if method != 'GET':
+        send_http_response(sock, '405 Method Not Allowed', b'Method Not Allowed')
+        return
+    full = resolve_static_path(target)
+    if full is None or not os.path.isfile(full):
+        send_http_response(sock, '404 Not Found', b'Not Found')
+        return
+    ext = os.path.splitext(full)[1].lower()
+    ctype = CONTENT_TYPES.get(ext, 'application/octet-stream')
+    with open(full, 'rb') as fh:
+        body = fh.read()
+    send_http_response(sock, '200 OK', body, ctype)
+
+
+def handle_connection(sock, addr):
+    try:
+        head = b''
+        while b'\r\n\r\n' not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return
+            head += chunk
+            if len(head) > 65536:
+                return
+        head_bytes, _, leftover = head.partition(b'\r\n\r\n')
+        header_text = head_bytes.decode('utf-8', errors='ignore')
+        lines = header_text.split('\r\n')
+        request_line = lines[0] if lines else ''
+        is_ws = any(line.lower().startswith('upgrade:') and 'websocket' in line.lower()
+                    for line in lines[1:])
+
+        if is_ws:
+            bsock = BufferedSocket(sock, leftover)
+            if not do_handshake(bsock, header_text):
+                return
+            handle_ws_client(bsock)  # closes the socket itself
+            return
+
+        serve_static(sock, request_line)
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def run_server():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', WS_PORT))
-    srv.listen(8)
+    srv.bind(('0.0.0.0', PORT))
+    srv.listen(16)
     while True:
         sock, addr = srv.accept()
-        threading.Thread(target=handle_client, args=(sock, addr), daemon=True).start()
-
-
-class QuietHandler(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
-
-
-def http_server():
-    public_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'public')
-    handler = lambda *a, **kw: QuietHandler(*a, directory=public_dir, **kw)
-    with socketserver.ThreadingTCPServer(('0.0.0.0', HTTP_PORT), handler) as httpd:
-        httpd.allow_reuse_address = True
-        httpd.serve_forever()
+        threading.Thread(target=handle_connection, args=(sock, addr), daemon=True).start()
 
 
 def local_ips():
@@ -705,14 +844,11 @@ def local_ips():
 
 
 if __name__ == '__main__':
-    terrain = generate_terrain()
-
     threading.Thread(target=game_loop, daemon=True).start()
-    threading.Thread(target=ws_server, daemon=True).start()
 
-    print("Tanks server running:")
-    print(f"  http://localhost:{HTTP_PORT}")
+    print(f"Tanks server running on port {PORT}:")
+    print(f"  http://localhost:{PORT}")
     for ip in local_ips():
-        print(f"  http://{ip}:{HTTP_PORT}  (for others on your network)")
+        print(f"  http://{ip}:{PORT}  (for others on your network)")
 
-    http_server()
+    run_server()
