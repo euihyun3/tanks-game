@@ -54,16 +54,26 @@ const WEAPON_LABELS = { basic: 'BASIC', tnt: 'TNT', scatter: 'SCATTER', flame: '
 const CRATE_COLORS = { tnt: '#d4552a', scatter: '#4a8fd4', flame: '#ff9631', mg: '#e8d84a' };
 
 // ===== local players (1 or 2 on this device, each with its own websocket) =====
+// Every join bumps sessionId. Sockets from an earlier session are stamped with
+// the old id, so a late frame from a connection we already quit can be dropped
+// instead of mutating the new session's state.
+let sessionId = 0;
 const locals = [];
 function makeLocal(slot, name, color) {
   return {
     slot, name, color,
     id: null,
     ws: null,
+    session: sessionId,
     input: { left: false, right: false, up: false, down: false, space: false },
     ammoTotal: null,     // for pickup sound detection
     sndCharging: false,  // whether we started a charge sound
   };
+}
+
+// Does this (local, socket) pair still belong to the live session?
+function isLive(local, sock) {
+  return local.session === sessionId && local.ws === sock && locals.indexOf(local) !== -1;
 }
 
 function getPlayer(local) {
@@ -79,6 +89,14 @@ function localTag(id) {
     return ' (you)';
   }
   return '';
+}
+
+// ===== names: computer opponents get a [CPU] suffix everywhere a name shows =====
+// (server-side bots are flagged with `bot: true` on the player object; they are
+// never in `locals`, so they can never be mistaken for a local player)
+function nameOf(p) {
+  if (!p) return '';
+  return (p.name || 'Player ' + p.id) + (p.bot ? ' [CPU]' : '');
 }
 
 function modeTag() {
@@ -121,9 +139,11 @@ const joinForm = document.getElementById('join-panel');
 const name1Input = document.getElementById('join-name');
 const name2Input = document.getElementById('join-name2');
 const p2Extra = document.getElementById('p2-extra');
+const quitBtn = document.getElementById('quit-btn');
 
 let chosenMode = 'classic';
 let localCount = 1;
+let botCount = 0;   // server-side computer opponents to request (0-2)
 const selectedColors = ['#7a8b3f', '#5d7a8c'];
 
 const PALETTE = [
@@ -221,6 +241,15 @@ for (const btn of pcBtns) {
   });
 }
 
+// computer-opponents picker (sent as `bots` on the first local player's join)
+const botBtns = Array.from(document.querySelectorAll('#bots-row .opt-btn'));
+for (const btn of botBtns) {
+  btn.addEventListener('click', () => {
+    botCount = parseInt(btn.dataset.bots, 10) || 0;
+    botBtns.forEach((b) => b.classList.toggle('selected', b === btn));
+  });
+}
+
 function setHelpText() {
   const classic = (serverMode || chosenMode) !== 'chaos';
   const sep = ' &nbsp;|&nbsp; ';
@@ -241,6 +270,7 @@ function setHelpText() {
         'Fire: hold <b>Space</b>, release to shoot' + sep +
         'Weapon: <b>1-5</b> or <b>Q</b> to cycle';
   }
+  if (locals.length) helpEl.innerHTML += sep + '<b>Esc</b> quit';
 }
 
 joinForm.addEventListener('submit', (e) => {
@@ -256,6 +286,8 @@ joinForm.addEventListener('submit', (e) => {
   buildKeymaps();
   setHelpText();
   overlayEl.style.display = 'none';
+  quitBtn.style.display = 'block';
+  statusEl.className = '';
   statusEl.textContent = 'Connecting...';
   // P1 connects first; P2 (if any) joins P1's room once the welcome names it
   const requested = roomChoice === 'join' ? roomCodeInput.value.trim().toUpperCase() : '';
@@ -267,14 +299,27 @@ function connect(local, room) {
   local.ws = sock;
 
   sock.onopen = () => {
-    sock.send(JSON.stringify({ type: 'join', name: local.name, color: local.color, mode: chosenMode, room: room || '' }));
+    if (!isLive(local, sock)) { closeSocket(sock); return; }
+    // only the first local player asks for bots — a second request on P2's
+    // connection would double them up
+    sock.send(JSON.stringify({
+      type: 'join',
+      name: local.name,
+      color: local.color,
+      mode: chosenMode,
+      room: room || '',
+      bots: local.slot === 0 ? botCount : 0,
+    }));
     if (local.slot === 0) statusEl.textContent = 'Connected. Waiting for another player...';
   };
   sock.onclose = () => {
+    // a socket we closed ourselves (quit) is not a server problem
+    if (!isLive(local, sock)) return;
     if (local.slot === 0) statusEl.textContent = 'Disconnected from server.';
   };
 
   sock.onmessage = (event) => {
+    if (!isLive(local, sock)) return; // stale connection from a quit session
     const msg = JSON.parse(event.data);
     if (msg.type === 'welcome') {
       local.id = msg.id;
@@ -309,6 +354,65 @@ function connect(local, room) {
     }
   };
 }
+
+// ===== quit: drop the room and go back to the start screen =====
+function closeSocket(sock) {
+  if (!sock) return;
+  // drop the handlers first so nothing from this socket can touch the next session
+  sock.onopen = null;
+  sock.onmessage = null;
+  sock.onclose = null;
+  sock.onerror = null;
+  try { sock.close(); } catch (e) { /* already closing */ }
+}
+
+// Wipe every piece of module-level state a session leaves behind, so the next
+// join starts from exactly the same place a fresh page load would.
+function resetSession() {
+  terrain = null;
+  latestState = null;
+  serverMode = null;
+  roomCode = null;
+  trail = [];
+  particles.length = 0;
+  prevProjs = null;
+  snd.projByKind = {};
+  snd.turn = null;
+  snd.winner = null;
+  snd.fires = 0;
+  snd.lastMg = 0;
+  tilts.clear();
+  keymaps = [];
+  cycleKeys = {};
+  tctx.clearRect(0, 0, LW, LH); // pre-rendered terrain buffer
+}
+
+function quitToJoin() {
+  if (!locals.length) return;
+  const old = locals.slice();
+  // bump the session and empty `locals` BEFORE closing, so any callback that
+  // still slips through fails isLive()
+  sessionId++;
+  locals.length = 0;
+  if (window.SFX) SFX.chargeStop(); // kill a looping charge tone
+  for (const l of old) {
+    l.sndCharging = false;
+    const sock = l.ws;
+    l.ws = null;
+    closeSocket(sock);
+  }
+  resetSession();
+  quitBtn.style.display = 'none';
+  overlayEl.style.display = 'flex';
+  statusEl.className = '';
+  statusEl.textContent = 'Enter your name and join the battle';
+  setHelpText();
+  name1Input.focus();
+}
+
+quitBtn.addEventListener('click', quitToJoin);
+// never let the button take focus: a focused button turns Space into a quit
+quitBtn.addEventListener('mousedown', (e) => e.preventDefault());
 
 // ===== sounds: compare consecutive states to trigger effects =====
 const snd = { projByKind: {}, turn: null, winner: null, fires: 0, lastMg: 0 };
@@ -366,7 +470,7 @@ function playStateSounds(msg) {
 
 function playerName(id) {
   const p = latestState && latestState.players.find((pl) => pl.id === id);
-  return p && p.name ? p.name : 'Player ' + id;
+  return p ? nameOf(p) : 'Player ' + id;
 }
 
 function updateStatus(msg) {
@@ -539,6 +643,13 @@ function canAct(local) {
 }
 
 window.addEventListener('keydown', (e) => {
+  // Esc quits the room from anywhere during play (checked before the
+  // input/button guard so it works even if a control has focus)
+  if (e.key === 'Escape' && locals.length) {
+    e.preventDefault();
+    quitToJoin();
+    return;
+  }
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
   if (window.SFX) SFX.init();
   if (!locals.length) return;
@@ -967,7 +1078,7 @@ function drawPhaseBanner() {
     const who = locals.length === 2 ? 'P' + (mine.slot + 1) + ': ' : 'YOUR TURN: ';
     text = who + phaseHint(mine, ph);
   } else {
-    text = ((p.name || 'PLAYER ' + p.id).toUpperCase()) + ' — ' + (ph === 'move' ? 'DRIVING' : 'AIMING');
+    text = nameOf(p).toUpperCase() + ' — ' + (ph === 'move' ? 'DRIVING' : 'AIMING');
   }
   vctx.font = 'bold 14px "Courier New", monospace';
   vctx.textAlign = 'center';
@@ -988,8 +1099,8 @@ function drawHiRes() {
     for (const p of latestState.players) {
       const tag = localTag(p.id);
       vctx.font = 'bold 13px "Courier New", monospace';
-      vctx.fillStyle = tag ? '#ffdd33' : '#f5f0dc';
-      const label = ((p.name || 'Player ' + p.id) + tag).toUpperCase();
+      vctx.fillStyle = tag ? '#ffdd33' : (p.bot ? '#b9c0cf' : '#f5f0dc');
+      const label = (nameOf(p) + tag).toUpperCase();
       vctx.fillText(label, p.x, p.y - 32);
       if (!p.alive) {
         vctx.font = '16px system-ui, sans-serif';

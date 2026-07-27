@@ -150,6 +150,31 @@
     #join-btn:hover {
       background: #a3b56a;
     }
+    /* QUIT sits in the empty top-left sky: clear of the weapon HUD panels in the
+       bottom corners, the centred turn banner, and the room/mode badges at right. */
+    #quit-btn {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 5;
+      display: none;
+      padding: 5px 8px;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 10px;
+      font-weight: bold;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: #cdd6a3;
+      background: #1c1f16;
+      border: 3px solid #4a5238;
+      border-radius: 0;
+      box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.5);
+      cursor: pointer;
+    }
+    #quit-btn:hover {
+      border-color: #ffdd33;
+      color: #ffdd33;
+    }
   </style>
 </head>
 <body>
@@ -176,6 +201,12 @@
             <button type="button" class="opt-btn selected" data-pc="1">1</button>
             <button type="button" class="opt-btn" data-pc="2">2</button>
           </div>
+          <div class="opt-row" id="bots-row">
+            <span class="row-label">Computer opponents:</span>
+            <button type="button" class="opt-btn selected" data-bots="0">0</button>
+            <button type="button" class="opt-btn" data-bots="1">1</button>
+            <button type="button" class="opt-btn" data-bots="2">2</button>
+          </div>
           <input id="join-name" class="name-input" type="text" maxlength="12" placeholder="Player 1 name" autocomplete="off" autofocus />
           <div class="swatch-row" id="swatch-row1">
             <button type="button" class="swatch selected" data-color="#7a8b3f" style="background:#7a8b3f" title="Olive"></button>
@@ -194,6 +225,9 @@
           <button id="join-btn" type="submit">Join Battle</button>
         </form>
       </div>
+      <!-- tabindex=-1 so Tab can never park focus here and let Space quit by
+           accident; Escape is the keyboard route out. -->
+      <button id="quit-btn" type="button" tabindex="-1" title="Quit to the start screen (Esc)">Quit</button>
     </div>
     <p class="help">
       Classic: MOVE <b>&larr;/&rarr;</b>, <b>Space</b> done &middot;
