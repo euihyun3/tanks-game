@@ -31,9 +31,12 @@ MOVE_SPEED = 160
 ANGLE_SPEED = 90
 MIN_POWER = 220
 MAX_POWER = 620
-CHARGE_RATE = (MAX_POWER - MIN_POWER) / 1.1
+DEFAULT_POWER = max(MIN_POWER, min(MAX_POWER, 400.0))  # classic: persists per player
+POWER_RATE = 260          # classic aim phase: power units per second from left/right
+CHARGE_RATE = (MAX_POWER - MIN_POWER) / 1.1  # chaos only
+MOVE_BUDGET = 150.0       # classic: world px a tank may drive per turn
 FIRE_COOLDOWN = 0.4
-TANK_RADIUS = 16
+TANK_RADIUS = 11
 EXPLOSION_RADIUS = 46
 MAX_DAMAGE = 45
 RESET_DELAY = 3.0
@@ -57,7 +60,7 @@ STARTING_AMMO = {'tnt': 1, 'scatter': 1, 'flame': 1, 'mg': 30}
 
 CRATE_INTERVAL = 7.0
 MAX_CRATES = 5
-CRATE_PICKUP_DIST = 26
+CRATE_PICKUP_DIST = 20
 FIRE_TTL = 4.0
 FIRE_RADIUS = 28
 FIRE_DPS = 8.0
@@ -85,6 +88,7 @@ def new_room_code():
 
 
 def make_room(code, mode_req=None):
+    mode = mode_req if mode_req in ('classic', 'chaos') else 'classic'
     return {
         'code': code,
         'players': {},        # conn -> player dict
@@ -97,8 +101,10 @@ def make_room(code, mode_req=None):
         'winner': None,
         'reset_at': None,
         'current_turn': None,  # player id whose turn it is
-        'turn_phase': 'aim',   # 'aim' while waiting for the shot, 'firing' while shell in flight
-        'mode': mode_req if mode_req in ('classic', 'chaos') else 'classic',
+        # classic: 'move' (drive on a budget) -> 'aim' (angle/power) -> 'firing' (shot resolving)
+        # chaos: always 'aim'; the client ignores the phase there
+        'turn_phase': 'aim' if mode == 'chaos' else 'move',
+        'mode': mode,
         'last_crate_spawn': time.monotonic(),
     }
 
@@ -113,6 +119,7 @@ def get_or_create_room(code_raw, mode_req):
         if not room['players']:
             # joining an empty room: joiner is effectively the host, picks the mode
             room['mode'] = mode_req if mode_req in ('classic', 'chaos') else 'classic'
+            room['turn_phase'] = 'aim' if room['mode'] == 'chaos' else 'move'
         return room
     if not code:
         code = new_room_code()
@@ -162,7 +169,8 @@ def make_player(room, pid):
         'color': COLORS[idx % len(COLORS)],
         'x': spawn_position(room),
         'angle': 45.0,
-        'power': MIN_POWER,
+        'power': DEFAULT_POWER,   # classic: persists across turns
+        'move_left': MOVE_BUDGET,  # classic: driving budget left this turn (chaos ignores it)
         'charging': False,
         'charge_start': 0.0,
         'cooldown': 0.0,
@@ -190,7 +198,8 @@ def reset_round(room):
     for p in room['players'].values():
         p['x'] = spawn_position(room)
         p['angle'] = 45.0
-        p['power'] = MIN_POWER
+        p['power'] = DEFAULT_POWER
+        p['move_left'] = MOVE_BUDGET
         p['charging'] = False
         p['cooldown'] = 0.0
         p['hp'] = 100
@@ -202,17 +211,29 @@ def reset_round(room):
         p['burst_timer'] = 0.0
     ids = sorted(p['id'] for p in room['players'].values())
     room['current_turn'] = ids[0] if ids else None
-    room['turn_phase'] = 'aim'
+    begin_turn(room)
+
+
+def begin_turn(room):
+    """Open the current player's turn: classic starts in 'move' with a fresh budget."""
+    if room['mode'] == 'chaos':
+        room['turn_phase'] = 'aim'
+        return
+    room['turn_phase'] = 'move'
+    for p in room['players'].values():
+        if p['id'] == room['current_turn']:
+            p['move_left'] = MOVE_BUDGET
 
 
 def advance_turn(room):
     alive = sorted(p['id'] for p in room['players'].values() if p['alive'])
-    room['turn_phase'] = 'aim'
     if not alive:
         room['current_turn'] = None
+        begin_turn(room)
         return
     later = [i for i in alive if room['current_turn'] is not None and i > room['current_turn']]
     room['current_turn'] = later[0] if later else alive[0]
+    begin_turn(room)
 
 
 def explode(room, x, y, radius=EXPLOSION_RADIUS, max_damage=MAX_DAMAGE):
@@ -264,8 +285,8 @@ def fire_projectile(room, p, angle_deg, power, kind):
     })
 
 
-def fire_charged(room, p):
-    """Release a charged shot with the player's current weapon (all but mg)."""
+def fire_weapon(room, p):
+    """Spawn the shot(s) for p's current weapon at its angle/power. Returns the weapon."""
     weapon = p['weapon']
     if weapon != 'basic' and p['ammo'].get(weapon, 0) <= 0:
         p['weapon'] = 'basic'
@@ -278,14 +299,26 @@ def fire_charged(room, p):
     else:
         fire_projectile(room, p, p['angle'], p['power'], weapon)
     consume_ammo(p, weapon)
+    return weapon
+
+
+def fire_charged(room, p):
+    """Chaos only: release a charged shot with the current weapon (all but mg)."""
+    weapon = fire_weapon(room, p)
     p['charging'] = False
     p['power'] = MIN_POWER
-    if room['mode'] == 'chaos':
-        p['wcd'][weapon] = CHAOS_COOLDOWNS[weapon]
-    else:
-        p['cooldown'] = FIRE_COOLDOWN
-        if len(room['players']) >= 2:
-            room['turn_phase'] = 'firing'
+    p['wcd'][weapon] = CHAOS_COOLDOWNS[weapon]
+
+
+def fire_aimed(room, p):
+    """Classic only: fire immediately at the held angle/power, then wait the shot out.
+
+    Power is NOT reset - it persists as the player's setting for later turns.
+    """
+    fire_weapon(room, p)
+    p['charging'] = False
+    p['cooldown'] = FIRE_COOLDOWN
+    room['turn_phase'] = 'firing'
 
 
 def tick(room):
@@ -307,58 +340,90 @@ def tick(room):
 
         if not p['alive']:
             continue
-        # chaos: everyone acts; classic: solo free practice or the active player only
-        my_turn = chaos or len(players) < 2 or (
-            p['id'] == room['current_turn'] and room['turn_phase'] == 'aim')
-        if not my_turn:
-            p['charging'] = False
-            p['prev_space'] = p['input']['space']
-            continue
         inp = p['input']
 
-        if inp['left']:
-            p['x'] -= MOVE_SPEED * dt
-        if inp['right']:
-            p['x'] += MOVE_SPEED * dt
-        p['x'] = max(TANK_RADIUS, min(WIDTH - TANK_RADIUS, p['x']))
+        if chaos:
+            # chaos: everyone acts at once, drives freely, charges and fires on release
+            if inp['left']:
+                p['x'] -= MOVE_SPEED * dt
+            if inp['right']:
+                p['x'] += MOVE_SPEED * dt
+            p['x'] = max(TANK_RADIUS, min(WIDTH - TANK_RADIUS, p['x']))
 
-        if inp['up']:
-            p['angle'] = min(180, p['angle'] + ANGLE_SPEED * dt)
-        if inp['down']:
-            p['angle'] = max(0, p['angle'] - ANGLE_SPEED * dt)
+            if inp['up']:
+                p['angle'] = min(180, p['angle'] + ANGLE_SPEED * dt)
+            if inp['down']:
+                p['angle'] = max(0, p['angle'] - ANGLE_SPEED * dt)
 
-        if p['weapon'] == 'mg':
-            p['charging'] = False
-            if chaos:
+            if p['weapon'] == 'mg':
+                p['charging'] = False
                 # hold to spray: one bullet per cooldown interval
                 if inp['space'] and p['wcd'].get('mg', 0) <= 0 and p['ammo']['mg'] > 0:
                     fire_projectile(room, p, p['angle'], MG_POWER, 'mg')
                     consume_ammo(p, 'mg')
                     p['wcd']['mg'] = CHAOS_COOLDOWNS['mg']
             else:
-                # classic: burst on release, server-timed
-                if (not inp['space'] and p['prev_space'] and p['cooldown'] <= 0
-                        and p['pending_burst'] == 0 and p['ammo']['mg'] > 0):
-                    p['pending_burst'] = BURST_SIZE
-                    p['burst_timer'] = 0.0
-                    p['cooldown'] = FIRE_COOLDOWN
-                    if len(players) >= 2:
-                        room['turn_phase'] = 'firing'
-        else:
-            can_start = (p['wcd'].get(p['weapon'], 0) <= 0) if chaos else (p['cooldown'] <= 0)
-            if inp['space'] and (p['charging'] or can_start):
-                if not p['charging']:
-                    p['charging'] = True
-                    p['charge_start'] = time.monotonic()
-                    p['power'] = MIN_POWER
-                else:
-                    elapsed = time.monotonic() - p['charge_start']
-                    p['power'] = min(MAX_POWER, MIN_POWER + elapsed * CHARGE_RATE)
-            elif not inp['space'] and p['prev_space'] and p['charging']:
-                fire_charged(room, p)
-        p['prev_space'] = inp['space']
+                can_start = p['wcd'].get(p['weapon'], 0) <= 0
+                if inp['space'] and (p['charging'] or can_start):
+                    if not p['charging']:
+                        p['charging'] = True
+                        p['charge_start'] = time.monotonic()
+                        p['power'] = MIN_POWER
+                    else:
+                        elapsed = time.monotonic() - p['charge_start']
+                        p['power'] = min(MAX_POWER, MIN_POWER + elapsed * CHARGE_RATE)
+                elif not inp['space'] and p['prev_space'] and p['charging']:
+                    fire_charged(room, p)
+            p['prev_space'] = inp['space']
+            continue
 
-    # classic mg bursts continue even after turn_phase leaves 'aim'
+        # classic: only the active player acts, through the move -> aim -> firing phases
+        p['charging'] = False  # no charging in classic
+        if p['id'] != room['current_turn']:
+            p['prev_space'] = inp['space']
+            continue
+        phase = room['turn_phase']
+        space_edge = inp['space'] and not p['prev_space']
+        p['prev_space'] = inp['space']  # every tick, so a held space can't retrigger
+
+        if phase == 'move':
+            dx = 0.0
+            if inp['left']:
+                dx -= MOVE_SPEED * dt
+            if inp['right']:
+                dx += MOVE_SPEED * dt
+            if dx and p['move_left'] > 0:
+                if abs(dx) > p['move_left']:
+                    dx = math.copysign(p['move_left'], dx)
+                before = p['x']
+                p['x'] = max(TANK_RADIUS, min(WIDTH - TANK_RADIUS, p['x'] + dx))
+                # only charge for distance actually travelled (the edge clamp is free)
+                p['move_left'] = max(0.0, p['move_left'] - abs(p['x'] - before))
+            if space_edge:
+                room['turn_phase'] = 'aim'
+        elif phase == 'aim':
+            if inp['up']:
+                p['angle'] = min(180, p['angle'] + ANGLE_SPEED * dt)
+            if inp['down']:
+                p['angle'] = max(0, p['angle'] - ANGLE_SPEED * dt)
+            if inp['right']:
+                p['power'] = min(MAX_POWER, p['power'] + POWER_RATE * dt)
+            if inp['left']:
+                p['power'] = max(MIN_POWER, p['power'] - POWER_RATE * dt)
+            if space_edge:
+                if p['weapon'] == 'mg':
+                    # server-timed burst, fired off over the next few ticks
+                    if (p['cooldown'] <= 0 and p['pending_burst'] == 0
+                            and p['ammo']['mg'] > 0):
+                        p['pending_burst'] = BURST_SIZE
+                        p['burst_timer'] = 0.0
+                        p['cooldown'] = FIRE_COOLDOWN
+                        room['turn_phase'] = 'firing'
+                elif p['cooldown'] <= 0:
+                    fire_aimed(room, p)
+        # 'firing': no player input acts
+
+    # classic mg bursts keep firing during the 'firing' phase
     for p in players.values():
         if p['pending_burst'] <= 0:
             continue
@@ -429,7 +494,14 @@ def tick(room):
     if now - room['last_crate_spawn'] >= CRATE_INTERVAL:
         room['last_crate_spawn'] = now
         if len(crates) < MAX_CRATES:
-            cx = random.uniform(60, WIDTH - 60)
+            # drop near a random living tank so it stays reachable on one move budget
+            standing = [p for p in players.values() if p['alive']]
+            if standing:
+                anchor = random.choice(standing)
+                cx = max(60.0, min(float(WIDTH - 60),
+                                   anchor['x'] + random.uniform(-250, 250)))
+            else:
+                cx = random.uniform(60, WIDTH - 60)
             crates.append({'x': cx, 'y': terrain_height_at(room, cx),
                            'kind': random.choice(['tnt', 'scatter', 'flame', 'mg'])})
     for c in crates[:]:
@@ -444,6 +516,13 @@ def tick(room):
     if (not chaos and room['turn_phase'] == 'firing' and not projectiles
             and not any(p['pending_burst'] > 0 for p in players.values())):
         advance_turn(room)
+
+    # the active player can die on their own turn (fire damage) — hand the turn
+    # on, or the room stalls waiting for input from a wreck
+    if not chaos and room['turn_phase'] in ('move', 'aim'):
+        active = next((p for p in players.values() if p['id'] == room['current_turn']), None)
+        if (active is None or not active['alive']) and any(p['alive'] for p in players.values()):
+            advance_turn(room)
 
     if room['winner'] is None and room['reset_at'] is None and len(players) >= 2:
         alive = [p for p in players.values() if p['alive']]
@@ -479,6 +558,7 @@ def broadcast(room):
             'alive': p['alive'],
             'charging': p['charging'],
             'power': p['power'],
+            'moveLeft': p['move_left'],
             'weapon': p['weapon'],
             'ammo': p['ammo'],
         } for p in players.values()],
@@ -648,6 +728,7 @@ def join_room(conn, join_msg):
     room['terrain_changed'] = True
     if room['current_turn'] is None:
         room['current_turn'] = pid
+        begin_turn(room)
     welcome = json.dumps({'type': 'welcome', 'id': pid, 'color': player['color'],
                           'width': WIDTH, 'height': HEIGHT,
                           'mode': room['mode'], 'room': room['code']})
@@ -661,7 +742,7 @@ def leave_room(conn, room, player):
     Caller must hold state_lock.
     """
     room['players'].pop(conn, None)
-    if player['id'] == room['current_turn'] and room['turn_phase'] == 'aim':
+    if player['id'] == room['current_turn'] and room['turn_phase'] in ('move', 'aim'):
         advance_turn(room)
     if not room['players']:
         rooms.pop(room['code'], None)

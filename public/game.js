@@ -26,17 +26,25 @@ function sizeBuffers() {
   off.height = LH;
   tCan.width = LW;
   tCan.height = LH;
+  // resizing a canvas resets its context state, so re-assert the pixel look
+  ctx.imageSmoothingEnabled = false;
+  tctx.imageSmoothingEnabled = false;
   if (terrain) renderTerrain();
 }
 sizeBuffers();
 
 // physics constants mirrored from the server for the aim-preview arc
 const GRAVITY = 260;
-const TANK_RADIUS = 16;
+const TANK_RADIUS = 11;
 const BARREL_LEN = TANK_RADIUS + 14;
 const MIN_POWER = 220;
 const MAX_POWER = 620;
 const MG_POWER = 520; // mg has no charge; flies at fixed power
+const MOVE_BUDGET = 150; // classic: world px of driving allowed per turn
+
+function clamp01(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
 
 // HTTP and WebSocket share one port now (works locally and on cloud hosts)
 const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
@@ -75,6 +83,36 @@ function localTag(id) {
 
 function modeTag() {
   return serverMode ? '[' + serverMode.toUpperCase() + '] ' : '';
+}
+
+function isClassic() {
+  return serverMode !== 'chaos';
+}
+
+// Which classic turn phase applies to this player, or null when phases don't
+// apply to them (chaos, someone else's turn, round over). Solo practice keeps
+// the old "do whatever you like" behaviour, reported as 'aim'.
+function classicPhase(id) {
+  if (!latestState || !isClassic() || latestState.winner) return null;
+  if (latestState.playerCount < 2) return 'aim';
+  if (latestState.currentTurn !== id) return null;
+  const ph = latestState.turnPhase;
+  return ph === 'move' || ph === 'firing' ? ph : 'aim';
+}
+
+// keys this local player uses, for phase hints (differs in 2-on-1-device mode)
+function keysFor(local) {
+  if (locals.length === 2 && local.slot === 0) {
+    return { lr: 'A/D', ud: 'W/S', fire: 'F' };
+  }
+  return { lr: '←/→', ud: '↑/↓', fire: 'SPACE' };
+}
+
+function phaseHint(local, ph) {
+  if (ph === 'firing') return 'SHELL IN FLIGHT';
+  const k = keysFor(local);
+  if (ph === 'move') return 'MOVE — ' + k.lr + ' DRIVE, ' + k.fire + ' WHEN DONE';
+  return 'AIM — ' + k.ud + ' ANGLE, ' + k.lr + ' POWER, ' + k.fire + ' FIRE';
 }
 
 // ===== join screen =====
@@ -184,16 +222,24 @@ for (const btn of pcBtns) {
 }
 
 function setHelpText() {
+  const classic = (serverMode || chosenMode) !== 'chaos';
+  const sep = ' &nbsp;|&nbsp; ';
   if (locals.length === 2) {
-    helpEl.innerHTML =
-      '<b>P1:</b> W/A/S/D move+aim, <b>F</b> fire, <b>Q</b> weapon &nbsp;|&nbsp; ' +
-      '<b>P2:</b> Arrow keys move+aim, <b>Space</b> fire, <b>M</b> weapon';
+    helpEl.innerHTML = classic
+      ? '<b>P1:</b> move <b>A/D</b>, <b>F</b> done &middot; aim <b>W/S</b> angle, <b>A/D</b> power, <b>F</b> fire &middot; <b>Q</b> wpn' + sep +
+        '<b>P2:</b> move <b>&larr;/&rarr;</b>, <b>Space</b> done &middot; aim <b>&uarr;/&darr;</b> angle, <b>&larr;/&rarr;</b> power, <b>Space</b> fire &middot; <b>M</b> wpn'
+      : '<b>P1:</b> W/A/S/D move+aim, <b>F</b> fire, <b>Q</b> weapon' + sep +
+        '<b>P2:</b> Arrow keys move+aim, <b>Space</b> fire, <b>M</b> weapon';
   } else {
-    helpEl.innerHTML =
-      'Move: <b>A/D</b> or <b>&larr;/&rarr;</b> &nbsp;|&nbsp; ' +
-      'Aim: <b>W/S</b> or <b>&uarr;/&darr;</b> &nbsp;|&nbsp; ' +
-      'Fire: hold <b>Space</b>, release to shoot &nbsp;|&nbsp; ' +
-      'Weapon: <b>1-5</b> or <b>Q</b> to cycle';
+    helpEl.innerHTML = classic
+      ? 'MOVE: <b>&larr;/&rarr;</b> drive, <b>Space</b> done' + sep +
+        'AIM: <b>&uarr;/&darr;</b> angle, <b>&larr;/&rarr;</b> power, <b>Space</b> fire' + sep +
+        'WASD too' + sep +
+        'Weapon: <b>1-5</b> or <b>Q</b>'
+      : 'Move: <b>A/D</b> or <b>&larr;/&rarr;</b>' + sep +
+        'Aim: <b>W/S</b> or <b>&uarr;/&darr;</b>' + sep +
+        'Fire: hold <b>Space</b>, release to shoot' + sep +
+        'Weapon: <b>1-5</b> or <b>Q</b> to cycle';
   }
 }
 
@@ -237,6 +283,7 @@ function connect(local, room) {
         roomCode = msg.room || null;
         if (locals[1] && !locals[1].ws) connect(locals[1], roomCode);
         serverMode = msg.mode || 'classic';
+        setHelpText(); // the server is authoritative about the mode
         if (msg.width && (msg.width !== W || msg.height !== H)) {
           W = msg.width;
           H = msg.height;
@@ -327,22 +374,32 @@ function updateStatus(msg) {
   if (msg.playerCount < 2) {
     statusEl.textContent = tag + 'Waiting for players — room code: ' + (roomCode || '...');
     statusEl.className = '';
-  } else if (msg.winner) {
+    return;
+  }
+  if (msg.winner) {
     statusEl.textContent = '';
-  } else if (serverMode === 'chaos') {
+    return;
+  }
+  if (serverMode === 'chaos') {
     statusEl.textContent = tag + 'Free-for-all — fire at will!';
     statusEl.className = '';
-  } else if (msg.turnPhase === 'firing') {
-    statusEl.textContent = 'Shell in flight...';
+    return;
+  }
+  // classic: phase drives the headline
+  const ph = msg.turnPhase === 'move' || msg.turnPhase === 'firing' ? msg.turnPhase : 'aim';
+  const mine = locals.find((l) => l.id === msg.currentTurn) || null;
+  if (ph === 'firing') {
+    statusEl.textContent = 'SHELL IN FLIGHT...';
     statusEl.className = '';
-  } else if (localTag(msg.currentTurn)) {
+  } else if (mine) {
     const who = locals.length === 2
-      ? playerName(msg.currentTurn) + localTag(msg.currentTurn) + ' — move, aim, fire!'
-      : 'YOUR TURN — move, aim, fire!';
-    statusEl.textContent = '🎯 ' + who;
+      ? playerName(msg.currentTurn) + localTag(msg.currentTurn)
+      : 'YOUR TURN';
+    statusEl.textContent = '🎯 ' + who + ': ' + phaseHint(mine, ph);
     statusEl.className = 'my-turn';
   } else {
-    statusEl.textContent = playerName(msg.currentTurn) + "'s turn...";
+    statusEl.textContent =
+      playerName(msg.currentTurn) + "'s turn — " + (ph === 'move' ? 'driving' : 'aiming') + '...';
     statusEl.className = '';
   }
 }
@@ -470,12 +527,15 @@ function cycleWeapon(local) {
   }
 }
 
-// whether this local player may act right now (solo play, chaos, or own turn)
+// whether the server will act on this local player's input right now
+// (solo play, chaos, or their own turn while it still accepts input)
 function canAct(local) {
   if (!latestState) return true;
   if (serverMode === 'chaos') return true;
   if (latestState.playerCount < 2) return true;
-  return latestState.currentTurn === local.id && latestState.turnPhase === 'aim';
+  if (latestState.currentTurn !== local.id) return false;
+  const ph = latestState.turnPhase;
+  return ph !== 'firing';
 }
 
 window.addEventListener('keydown', (e) => {
@@ -504,7 +564,8 @@ window.addEventListener('keydown', (e) => {
     if (!local.input[action]) {
       local.input[action] = true;
       send(local);
-      if (action === 'space' && window.SFX && canAct(local)) {
+      // charging only exists in chaos now; classic fires on the Space press
+      if (action === 'space' && window.SFX && serverMode === 'chaos' && canAct(local)) {
         const p = getPlayer(local);
         if (!p || p.weapon !== 'mg') { // mg has no charge
           SFX.charge();
@@ -568,82 +629,173 @@ function renderTerrain() {
   }
 }
 
-// rect-only 8-bit tank sprite (low-res coords)
+// ===== hull tilt: read the ground slope under the tank from the terrain array =====
+const TILT_MAX = (35 * Math.PI) / 180;        // cliffs must not flip the tank over
+const TILT_SPAN = 16;                         // world px each side: where the track ends sit
+const TILT_STEP = (5 * Math.PI) / 180;        // quantized: chunky and jitter-free
+const TILT_EASE = 0.25;                       // smoothing per frame
+const tilts = new Map();                      // player id -> smoothed tilt (radians)
+
+function groundAt(wx) {
+  const i = Math.max(0, Math.min(terrain.length - 1, Math.round(wx)));
+  return terrain[i];
+}
+
+// canvas y grows downward, so higher terrain value on the right == nose-down-right,
+// which is exactly the sign ctx.rotate() wants.
+function targetTilt(p) {
+  if (!terrain || !terrain.length) return 0;
+  const a = Math.atan2(groundAt(p.x + TILT_SPAN) - groundAt(p.x - TILT_SPAN), TILT_SPAN * 2);
+  return Math.max(-TILT_MAX, Math.min(TILT_MAX, a));
+}
+
+function tankTilt(p) {
+  const target = targetTilt(p);
+  const prev = tilts.get(p.id);
+  const next = prev === undefined ? target : prev + (target - prev) * TILT_EASE;
+  tilts.set(p.id, next);
+  return Math.round(next / TILT_STEP) * TILT_STEP;
+}
+
+// second bar above the tank: charge in chaos, move budget / power in classic
+function tankBar(p) {
+  if (!isClassic()) {
+    if (!p.charging) return null;
+    return { pct: clamp01((p.power - MIN_POWER) / (MAX_POWER - MIN_POWER)), color: '#ffdd33' };
+  }
+  const ph = classicPhase(p.id);
+  if (ph === 'move') {
+    const left = typeof p.moveLeft === 'number' ? p.moveLeft : MOVE_BUDGET;
+    return { pct: clamp01(left / MOVE_BUDGET), color: '#5ad24a' };
+  }
+  if (ph === 'aim') {
+    return { pct: clamp01((p.power - MIN_POWER) / (MAX_POWER - MIN_POWER)), color: '#ffdd33' };
+  }
+  return null;
+}
+
+// The tilted part of the tank is drawn into a tiny sprite buffer first, then
+// blitted through ctx.rotate with smoothing off. Rotating fillRects directly
+// antialiases every edge into mush; rotating a bitmap resamples it
+// nearest-neighbour, which keeps the hard 8-bit pixel edges we want.
+const sprCan = document.createElement('canvas');
+sprCan.width = 24;
+sprCan.height = 24;
+const sctx = sprCan.getContext('2d');
+sctx.imageSmoothingEnabled = false;
+const SPR_C = 12; // sprite-space coords of the tank centre
+
+// hull + tracks + turret, unrotated, centred at (SPR_C, SPR_C)
+function paintHullSprite(body, dark, light) {
+  sctx.clearRect(0, 0, 24, 24);
+  sctx.setTransform(1, 0, 0, 1, SPR_C, SPR_C);
+
+  // tracks
+  sctx.fillStyle = '#2b2b22';
+  sctx.fillRect(-8, 2, 16, 4);
+  sctx.fillStyle = '#555555';
+  for (let i = -7; i <= 5; i += 3) {
+    sctx.fillRect(i, 3, 2, 1);
+  }
+
+  // hull
+  sctx.fillStyle = body;
+  sctx.fillRect(-7, -1, 14, 3);
+  sctx.fillStyle = light;
+  sctx.fillRect(-7, -1, 14, 1);
+
+  // turret
+  sctx.fillStyle = light;
+  sctx.fillRect(-3, -4, 6, 3);
+  sctx.fillStyle = dark;
+  sctx.fillRect(-1, -5, 2, 1); // hatch
+
+  sctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+// rect-only 8-bit tank sprite (low-res coords), hull tilted onto the ground slope
+const PIVOT_DY = -3; // turret/barrel pivot, in unrotated sprite space
 function drawTankLow(p) {
   const x = Math.round(p.x / SCALE);
   const y = Math.round(p.y / SCALE);
   const body = p.alive ? p.color : '#4a4a4a';
   const dark = p.alive ? shade(p.color, 0.55) : '#2e2e2e';
   const light = p.alive ? shade(p.color, 1.25) : '#5a5a5a';
+  const tilt = tankTilt(p);
+  const cos = Math.cos(tilt);
+  const sin = Math.sin(tilt);
 
-  // barrel: thick pixel line at the aim angle (behind the turret)
+  // Barrel: drawn at the ABSOLUTE world angle — p.angle must read the same on
+  // every slope — but its pivot rides along with the tilted turret.
   const rad = (p.angle * Math.PI) / 180;
+  const px = x - PIVOT_DY * sin;
+  const py = y + PIVOT_DY * cos;
   ctx.fillStyle = dark;
-  for (let i = 4; i <= 15; i++) {
-    const bx = Math.round(x + i * Math.cos(rad));
-    const by = Math.round(y - 4 - i * Math.sin(rad));
+  for (let i = 3; i <= 12; i++) {
+    const bx = Math.round(px + i * Math.cos(rad));
+    const by = Math.round(py - i * Math.sin(rad));
     ctx.fillRect(bx - 1, by - 1, 2, 2);
   }
 
-  // tracks
-  ctx.fillStyle = '#2b2b22';
-  ctx.fillRect(x - 12, y + 3, 24, 6);
-  ctx.fillStyle = '#555555';
-  for (let i = -10; i <= 8; i += 4) {
-    ctx.fillRect(x + i, y + 5, 2, 2);
-  }
-
-  // hull
-  ctx.fillStyle = body;
-  ctx.fillRect(x - 10, y - 2, 20, 5);
-  ctx.fillStyle = light;
-  ctx.fillRect(x - 10, y - 2, 20, 1);
-
-  // turret
-  ctx.fillStyle = light;
-  ctx.fillRect(x - 4, y - 7, 8, 5);
-  ctx.fillStyle = dark;
-  ctx.fillRect(x - 1, y - 8, 3, 1); // hatch
+  // hull + tracks + turret body: these follow the slope
+  paintHullSprite(body, dark, light);
+  ctx.save();
+  ctx.imageSmoothingEnabled = false; // chunky nearest-neighbour rotation
+  ctx.translate(x, y);
+  if (tilt) ctx.rotate(tilt);
+  ctx.drawImage(sprCan, -SPR_C, -SPR_C);
+  ctx.restore();
 
   if (!p.alive) return;
 
-  // hp bar
+  // hp bar — always level, never tilted
   ctx.fillStyle = '#000000';
-  ctx.fillRect(x - 10, y - 22, 20, 3);
+  ctx.fillRect(x - 7, y - 14, 14, 3);
   ctx.fillStyle = p.hp > 40 ? '#4caf50' : '#e53935';
-  ctx.fillRect(x - 10, y - 22, Math.max(0, Math.round(20 * (p.hp / 100))), 3);
+  ctx.fillRect(x - 7, y - 14, Math.max(0, Math.round(14 * (p.hp / 100))), 3);
 
-  // charge bar
-  if (p.charging) {
-    const pct = Math.min(1, (p.power - MIN_POWER) / (MAX_POWER - MIN_POWER));
+  // move / power / charge bar — also level
+  const bar = tankBar(p);
+  if (bar) {
     ctx.fillStyle = '#000000';
-    ctx.fillRect(x - 10, y - 17, 20, 3);
-    ctx.fillStyle = '#ffdd33';
-    ctx.fillRect(x - 10, y - 17, Math.round(20 * pct), 3);
+    ctx.fillRect(x - 7, y - 10, 14, 3);
+    ctx.fillStyle = bar.color;
+    ctx.fillRect(x - 7, y - 10, Math.max(0, Math.round(14 * bar.pct)), 3);
   }
 }
 
-// dotted preview arc, chunky low-res dots
+// One preview dot: bright core inside a dark 1px outline, so it stays readable
+// over both the light-blue sky and the brown dirt. 4x4 low-res = 8x8 visible px.
+function drawPreviewDot(wx, wy) {
+  const lx = Math.round(wx / SCALE);
+  const ly = Math.round(wy / SCALE);
+  ctx.fillStyle = '#14100a';
+  ctx.fillRect(lx - 1, ly - 1, 4, 4);
+  ctx.fillStyle = '#fff45c';
+  ctx.fillRect(lx, ly, 2, 2);
+}
+
+// dotted preview arc, chunky low-res dots — plotted only up to the APEX
 function drawAimPreview(p, power) {
-  if (!terrain) return;
+  if (!terrain || !terrain.length) return;
   const rad = (p.angle * Math.PI) / 180;
   let x = p.x + BARREL_LEN * Math.cos(rad);
   let y = p.y - BARREL_LEN * Math.sin(rad);
-  let vx = power * Math.cos(rad);
+  const vx = power * Math.cos(rad);
   let vy = -power * Math.sin(rad);
   const dt = 0.045;
 
-  ctx.fillStyle = 'rgba(255, 221, 51, 0.85)';
-  for (let i = 0; i < 70; i++) {
+  for (let i = 0; i < 120; i++) {
+    const rising = vy <= 0; // y grows downward, so negative vy == climbing
     vy += GRAVITY * dt;
     x += vx * dt;
     y += vy * dt;
-    if (x < 0 || x > W || y > H) break;
-    const tx = Math.max(0, Math.min(W, Math.round(x)));
-    if (y >= terrain[tx]) break;
-    if (i % 2 === 0) {
-      ctx.fillRect(Math.round(x / SCALE), Math.round(y / SCALE), 1, 1);
-    }
+    if (x < 0 || x > W || y > H) break;             // left the map
+    const tx = Math.max(0, Math.min(terrain.length - 1, Math.round(x)));
+    if (y >= terrain[tx]) break;                    // hit dirt before the apex
+    const apex = rising && vy >= 0;                 // stopped climbing: this is the top
+    if (i % 2 === 0 || apex) drawPreviewDot(x, y);
+    if (apex) break;                                // never plot the descending half
   }
 }
 
@@ -651,7 +803,12 @@ function drawAimPreviews() {
   for (const local of locals) {
     const p = getPlayer(local);
     if (!p || !p.alive) continue;
-    if (p.charging) {
+    if (isClassic()) {
+      // no charging in classic: the preview is simply up for the whole aim phase
+      if (classicPhase(p.id) === 'aim') {
+        drawAimPreview(p, p.weapon === 'mg' ? MG_POWER : p.power);
+      }
+    } else if (p.charging) {
       drawAimPreview(p, p.power);
     } else if (p.weapon === 'mg' && local.input.space && canAct(local)) {
       drawAimPreview(p, MG_POWER);
@@ -719,14 +876,49 @@ function drawProjectilesLow() {
 }
 
 // ===== hi-res overlay (text pass on the visible canvas) =====
+// classic phase row at the bottom of a player's HUD panel: MOVE budget / POWER
+function drawPhaseRow(x, baseY, w, p) {
+  const ph = classicPhase(p.id);
+  vctx.font = 'bold 11px "Courier New", monospace';
+  if (ph === null) {
+    vctx.fillStyle = '#5a5a5a';
+    vctx.fillText('WAIT', x, baseY);
+    return;
+  }
+  if (ph === 'firing') {
+    vctx.fillStyle = '#ff9631';
+    vctx.fillText('FIRING', x, baseY);
+    return;
+  }
+  const move = ph === 'move';
+  const color = move ? '#5ad24a' : '#ffdd33';
+  const pct = move
+    ? clamp01((typeof p.moveLeft === 'number' ? p.moveLeft : MOVE_BUDGET) / MOVE_BUDGET)
+    : clamp01((p.power - MIN_POWER) / (MAX_POWER - MIN_POWER));
+  vctx.fillStyle = color;
+  vctx.fillText(move ? 'MOVE' : 'PWR', x, baseY);
+  const bx = x + 34;
+  const bw = Math.max(10, w - 34);
+  const by = baseY - 8;
+  const bh = 9;
+  vctx.fillStyle = '#000000';
+  vctx.fillRect(bx, by, bw, bh);
+  vctx.strokeStyle = color;
+  vctx.lineWidth = 1;
+  vctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+  vctx.fillStyle = color;
+  vctx.fillRect(bx + 2, by + 2, Math.round((bw - 4) * pct), bh - 4);
+}
+
 function drawHud() {
   const lineH = 14;
   const pad = 8;
   const panelW = 132;
+  const classic = isClassic();
   for (const local of locals) {
     const p = getPlayer(local);
     if (!p) continue;
-    const panelH = pad * 2 + lineH * (WEAPONS.length + 1);
+    const panelH = pad * 2 + lineH * (WEAPONS.length + 1 + (classic ? 1 : 0));
     const x = local.slot === 0 ? 10 : W - 10 - panelW;
     const y = H - 10 - panelH;
 
@@ -752,23 +944,56 @@ function drawHud() {
       vctx.fillStyle = current ? '#ffdd33' : (ammo === 0 ? '#5a5a5a' : '#e8e4d0');
       vctx.fillText((current ? '>' : ' ') + keyTxt + WEAPON_LABELS[w] + ammoTxt, x + pad, y + pad + 9 + lineH * (i + 1));
     }
+    if (classic) {
+      drawPhaseRow(x + pad, y + pad + 9 + lineH * (WEAPONS.length + 1), panelW - pad * 2, p);
+    }
     vctx.textAlign = 'center';
   }
+}
+
+// big, unmissable "whose turn / which phase" banner across the top (classic only)
+function drawPhaseBanner() {
+  if (!latestState || !isClassic()) return;
+  if (latestState.winner || latestState.playerCount < 2) return;
+  const p = latestState.players.find((pl) => pl.id === latestState.currentTurn);
+  if (!p) return;
+  const ph = latestState.turnPhase === 'move' || latestState.turnPhase === 'firing'
+    ? latestState.turnPhase : 'aim';
+  const mine = locals.find((l) => l.id === latestState.currentTurn) || null;
+  let text;
+  if (ph === 'firing') {
+    text = 'SHELL IN FLIGHT';
+  } else if (mine) {
+    const who = locals.length === 2 ? 'P' + (mine.slot + 1) + ': ' : 'YOUR TURN: ';
+    text = who + phaseHint(mine, ph);
+  } else {
+    text = ((p.name || 'PLAYER ' + p.id).toUpperCase()) + ' — ' + (ph === 'move' ? 'DRIVING' : 'AIMING');
+  }
+  vctx.font = 'bold 14px "Courier New", monospace';
+  vctx.textAlign = 'center';
+  const bw = vctx.measureText(text).width + 24;
+  vctx.fillStyle = 'rgba(10, 12, 8, 0.72)';
+  vctx.fillRect(Math.round(W / 2 - bw / 2), 6, Math.round(bw), 24);
+  vctx.strokeStyle = mine ? '#ffdd33' : '#4a5238';
+  vctx.lineWidth = 2;
+  vctx.strokeRect(Math.round(W / 2 - bw / 2) + 1, 7, Math.round(bw) - 2, 22);
+  vctx.fillStyle = mine ? '#ffdd33' : '#cdd6a3';
+  vctx.fillText(text, W / 2, 23);
 }
 
 function drawHiRes() {
   vctx.textAlign = 'center';
   if (latestState) {
-    // name labels + death markers
+    // name labels + death markers (level, above the smaller tanks)
     for (const p of latestState.players) {
       const tag = localTag(p.id);
       vctx.font = 'bold 13px "Courier New", monospace';
       vctx.fillStyle = tag ? '#ffdd33' : '#f5f0dc';
       const label = ((p.name || 'Player ' + p.id) + tag).toUpperCase();
-      vctx.fillText(label, p.x, p.y - 52);
+      vctx.fillText(label, p.x, p.y - 32);
       if (!p.alive) {
         vctx.font = '16px system-ui, sans-serif';
-        vctx.fillText('💥', p.x, p.y - 18);
+        vctx.fillText('💥', p.x, p.y - 14);
       }
     }
 
@@ -781,6 +1006,7 @@ function drawHiRes() {
     }
 
     drawHud();
+    drawPhaseBanner();
 
     if (latestState.winner) {
       vctx.fillStyle = 'rgba(0,0,0,0.6)';
@@ -821,6 +1047,8 @@ function draw() {
     drawCratesLow();
     drawFiresLow();
     drawAimPreviews();
+    // keep the tilt-smoothing cache from growing over a long session
+    if (tilts.size > 16) tilts.clear();
     for (const p of latestState.players) drawTankLow(p);
     drawProjectilesLow();
   }

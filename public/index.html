@@ -14,6 +14,9 @@
       max-width: 100%;
       margin: 0 auto;
       min-height: 0;
+      /* the holder — not #game — is the grid item, so it carries the centering */
+      align-self: center;
+      justify-self: center;
     }
     #join-overlay {
       position: absolute;
@@ -193,10 +196,10 @@
       </div>
     </div>
     <p class="help">
-      Move: <b>A/D</b> or <b>&larr;/&rarr;</b> &nbsp;|&nbsp;
-      Aim: <b>W/S</b> or <b>&uarr;/&darr;</b> &nbsp;|&nbsp;
-      Fire: hold <b>Space</b>, release to shoot &nbsp;|&nbsp;
-      Weapon: <b>1-5</b> or <b>Q</b> to cycle
+      Classic: MOVE <b>&larr;/&rarr;</b>, <b>Space</b> done &middot;
+      AIM <b>&uarr;/&darr;</b> angle, <b>&larr;/&rarr;</b> power, <b>Space</b> fire &nbsp;|&nbsp;
+      Chaos: hold <b>Space</b> to charge &nbsp;|&nbsp;
+      Weapon: <b>1-5</b> or <b>Q</b>
     </p>
   </div>
   <script src="sounds.js"></script>
